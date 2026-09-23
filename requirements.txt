@@ -1,0 +1,26 @@
+# Offline vision + voice assistant — target: Windows, Intel iGPU/CPU only (NO CUDA)
+# Python 3.10 / 3.11
+
+# Vision
+opencv-python>=4.8
+numpy>=1.24,<3
+openvino>=2024.4.0
+onnxruntime>=1.18.0          # CPU fallback for DINOv2 / optional AVX speedup
+
+# Voice
+sherpa-onnx>=1.10.50         # VAD (Silero) + optional sherpa Paraformer path
+kaldi-native-fbank>=1.10.40  # Paraformer e2e feature pipeline (LFR+CMVN)
+sounddevice>=0.4.6
+soundfile>=0.12.1
+librosa>=0.10.0              # optional: only for tooling/tests
+
+# System / benchmark
+psutil>=5.9
+pyyaml>=6.0
+tqdm>=4.66
+
+# Optional: Windows GPU-engine utilization counter for benchmark.py (iGPU %)
+pywin32>=306; sys_platform == "win32"
+
+# NOTE: PyTorch is NOT required at runtime.
+# GPT-SoVITS runs as an independent module (see voice/tts_server.py).

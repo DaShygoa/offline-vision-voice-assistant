@@ -1,0 +1,28 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Models (large, offline-prepared via tools/prepare_models.py)
+models/**
+!models/.gitkeep
+
+# Runtime data / visual memory
+data/**
+!data/.gitkeep
+!data/.gitkeep
+
+# Reports / logs
+benchmark_report.json
+*.log
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
