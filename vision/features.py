@@ -1,4 +1,4 @@
-"""Bundle DINO + shape + depth for one crop — shared by remember/identify/search."""
+"""Single-channel feature holder for one crop (ResNet18 only, 选题一)."""
 
 from __future__ import annotations
 
@@ -10,14 +10,8 @@ import numpy as np
 
 @dataclass
 class FeatureBundle:
-    dino: Optional[np.ndarray] = None
-    shape: Optional[np.ndarray] = None
-    depth: Optional[np.ndarray] = None
+    embed: Optional[np.ndarray] = None  # L2-normalized ResNet18 512-d
 
     @property
     def any(self) -> bool:
-        return self.dino is not None or self.shape is not None or self.depth is not None
-
-    @property
-    def has_dino(self) -> bool:
-        return self.dino is not None
+        return self.embed is not None

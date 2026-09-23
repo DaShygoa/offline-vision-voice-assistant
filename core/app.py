@@ -1,14 +1,19 @@
-"""Main application orchestrator.
+"""Main application orchestrator (选题一: ResNet18 + 语音交互物体识别).
 
-Threading model (deployment rules):
-  ┌ main thread      : OpenCV camera UI loop @ 25–30 FPS (never blocks on TTS/ASR/DINO)
+Threading model:
+  ┌ main thread      : OpenCV camera UI loop @ 25–30 FPS (never blocks on TTS/ASR/embed)
   ├ camera thread    : frame capture → latest() buffer
-  ├ detect thread    : YOLO every N frames (≥5 det FPS), updates shared detections
+  ├ detect thread    : YOLO every N frames (optional ROI helper), updates shared detections
   ├ voice thread     : mic → VAD → ASR → intent → queue
-  ├ intent worker    : identify / remember / search logic (DINO + memory) → reply text → TTS queue
+  ├ intent worker    : identify / remember / search via ResNet18 + cosine feature bank
   └ tts worker       : GPT-SoVITS independent client (async; UI does not wait)
 
-DINO only runs on identify / remember / search — never in the camera hot path.
+Core flow (assignment):
+  enroll   : crop → ResNet18 512-d → save name + features to feature bank
+  identify : crop → ResNet18 → cosine vs bank → score >= threshold ? name : 未知物体
+  voice    : ASR says the object name / TTS announces the recognition result
+
+ResNet18 only runs on identify / remember / search — never in the camera hot path.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ import os
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 import cv2
@@ -27,14 +32,11 @@ import numpy as np
 from nlu.intent import Intent, IntentType, parse_intent
 from vision.camera import Camera
 from vision.detector import Detection, YoloDetector
-from vision.feature_extractor import DinoExtractor
+from vision.feature_extractor import ResNet18Extractor
 from vision.memory import MemoryMatch, VisualMemory
 from vision.object_cropper import ObjectCropper
 from vision.position import describe_position
 from vision.visualizer import OverlayState, Visualizer
-from vision.shape_descriptor import ShapeDescriptor
-from vision.depth import DepthExtractor
-from vision.features import FeatureBundle
 from ui.text_input import TextInputWindow
 from voice.asr import ParaformerASR
 from voice.mic import MicStream
@@ -49,10 +51,11 @@ class AppStats:
     ui_fps: float = 0.0
     det_fps: float = 0.0
     det_latency_ms: float = 0.0
-    dino_latency_ms: float = 0.0
+    embed_latency_ms: float = 0.0
     asr_latency_ms: float = 0.0
     last_intent: str = ""
     last_reply: str = ""
+    last_similarity: float = 0.0
     mem_objects: int = 0
     mode: str = "idle"
     tts_health: str = ""
@@ -76,15 +79,10 @@ class AssistantApp:
             width=int(cfg.get("app", {}).get("width", 1280)),
             height=int(cfg.get("app", {}).get("height", 720)),
         )
-        self.detector = YoloDetector(cfg.get("yolo", {}))
-        self.dino = DinoExtractor(cfg.get("dino", {}))
-        self.shape = ShapeDescriptor(cfg.get("shape", {}))
-        self.depth = DepthExtractor(cfg.get("depth", {}))
-        mem_cfg = dict(cfg.get("memory", {}))
-        # keep fusion flags consistent with extractors
-        mem_cfg.setdefault("use_shape", self.shape.enabled)
-        mem_cfg.setdefault("use_depth", self.depth.enabled)
-        self.memory = VisualMemory(mem_cfg)
+        self.yolo_enabled = bool(cfg.get("yolo", {}).get("enabled", True))
+        self.detector = YoloDetector(cfg.get("yolo", {})) if self.yolo_enabled else None
+        self.resnet = ResNet18Extractor(cfg.get("resnet18", {}))
+        self.memory = VisualMemory(cfg.get("memory", {}))
         self.cropper = ObjectCropper(
             center_roi_frac=float(cfg.get("memory", {}).get("center_roi_frac", 0.45)),
             min_crop_px=int(cfg.get("memory", {}).get("min_crop_px", 64)),
@@ -107,7 +105,7 @@ class AssistantApp:
         self._last_subtitle = ""
         self._subtitle_until = 0.0
         self._mic_muted_until = 0.0  # avoid hearing our own TTS (simple half-duplex)
-        self._learning_boxes: List[np.ndarray] = []
+        self._flash_until = 0.0
 
         # text command input (no-microphone fallback)
         app_cfg = cfg.get("app", {})
@@ -135,35 +133,28 @@ class AssistantApp:
     # ----------------------------------------------------------------- boot
     def start(self) -> None:
         log.info("Loading models …")
-        self.detector.load()
+        if self.detector is not None:
+            try:
+                self.detector.load()
+            except Exception as e:
+                log.warning("YOLO load failed (ROI falls back to center crop): %s", e)
+                self.detector = None
+                self.yolo_enabled = False
         try:
-            self.dino.load()
+            self.resnet.load()
         except Exception as e:
-            log.error("DINO failed to load (identify/remember degraded): %s", e)
-            self._dino_error = str(e)
-        if not getattr(self.dino, "ready", False):
-            if "No module named" in str(getattr(self, "_dino_error", "")) or self.dino.device_used == "none":
+            log.error(
+                "ResNet18 failed to load (identify/remember degraded): %s\n"
+                "  run: python tools/prepare_models.py --resnet18",
+                e,
+            )
+            self._resnet_error = str(e)
+        if not getattr(self.resnet, "ready", False):
+            if "No module named" in str(getattr(self, "_resnet_error", "")) or self.resnet.device_used == "none":
                 log.error(
-                    "提示: 识别/记忆需要 DINO + onnxruntime/openvino。"
+                    "提示: 识别/录入需要 ResNet18 + onnxruntime/openvino。"
                     " 请用 conda activate vision_ai 后再运行。"
                 )
-        # shape (pure OpenCV) + depth (MiDaS) side channels
-        try:
-            self.depth.load()
-        except Exception as e:
-            log.warning("Depth load failed (depth channel off): %s", e)
-        if self.depth.ready:
-            log.info("Depth ready: %s dim=%d", self.depth.device_used, self.depth.dim)
-        else:
-            log.info("Depth channel off (%s)", self.depth._error or "disabled")
-        log.info(
-            "Shape ready: enabled=%s dim=%d fusion w=[dino %.2f shape %.2f depth %.2f]",
-            self.shape.enabled,
-            self.shape.dim,
-            self.memory.w_dino,
-            self.memory.w_shape,
-            self.memory.w_depth,
-        )
         if self.use_voice:
             try:
                 self.asr.load()
@@ -179,14 +170,14 @@ class AssistantApp:
             self._ensure_text_input()
             self._overlay.input_visible = True
         elif self._text_input_enabled:
-            # with mic: still show bar, Tk window optional (off unless text_input_always)
             self._overlay.input_visible = True
 
         self._running = True
         self._threads = [
-            threading.Thread(target=self._detect_loop, name="detect", daemon=True),
             threading.Thread(target=self._intent_loop, name="intent", daemon=True),
         ]
+        if self.yolo_enabled and self.detector is not None:
+            self._threads.insert(0, threading.Thread(target=self._detect_loop, name="detect", daemon=True))
         if self.use_voice:
             self._threads.append(threading.Thread(target=self._voice_loop, name="voice", daemon=True))
         for t in self._threads:
@@ -195,13 +186,12 @@ class AssistantApp:
         st = self.memory.stats()
         self.stats.mem_objects = st["objects"]
         self.stats.tts_health = self.tts.health()
+        self._refresh_mem_info()
         log.info(
-            "Started. memory=%s yolo=%s dino=%s shape=%s depth=%s tts=%s voice=%s text_input=%s",
+            "Started. memory=%s yolo=%s resnet18=%s tts=%s voice=%s text_input=%s",
             st,
-            self.detector.device_used,
-            self.dino.device_used,
-            "on" if self.shape.enabled else "off",
-            self.depth.device_used if self.depth.ready else "off",
+            self.detector.device_used if self.detector else "off",
+            self.resnet.device_used,
             self.stats.tts_health,
             self.use_voice,
             "ime" if self.text_input else ("frame" if self._text_input_enabled else "off"),
@@ -209,7 +199,7 @@ class AssistantApp:
         if not self.use_voice:
             self.say("未检测到麦克风，可使用文本输入框发送指令。")
         else:
-            self.say("视觉助手已启动。")
+            self.say("物体识别助手已启动。")
 
     def stop(self) -> None:
         self._running = False
@@ -252,7 +242,10 @@ class AssistantApp:
                 self._det_fps_t0 = now
             if dets:
                 top = dets[0]
-                self.stats.det_info = f"YOLO {self.detector.device_used} | {top.label}:{top.conf:.2f} (+{len(dets)-1}) @{dt:.0f}ms"
+                self.stats.det_info = (
+                    f"YOLO {self.detector.device_used} | {top.label}:{top.conf:.2f} "
+                    f"(+{len(dets)-1}) @{dt:.0f}ms"
+                )
             else:
                 self.stats.det_info = f"YOLO {self.detector.device_used} | none @{dt:.0f}ms"
 
@@ -267,7 +260,6 @@ class AssistantApp:
             self.use_voice = False
             self._need_text_input = True  # opened on UI thread
             return
-        sr = self.mic.sample_rate
         buf: List[np.ndarray] = []
         speaking = False
         silence_frames = 0
@@ -293,7 +285,6 @@ class AssistantApp:
                     silence_frames = 0
                 else:
                     silence_frames += 1
-                # sherpa VAD path: finished signal
                 if self.vad.backend == "silero_sherpa" and self.vad.is_speech_finished():
                     pcm = self.vad.pop()
                     if pcm.size == 0:
@@ -324,7 +315,6 @@ class AssistantApp:
         except queue.Full:
             log.warning("intent queue full, dropping")
 
-    # inject text as if spoken (keyboard test mode)
     def inject_text(self, text: str) -> None:
         intent = parse_intent(text)
         self.stats.last_intent = f"{intent.type.value}:{intent.label or '-'}"
@@ -367,110 +357,108 @@ class AssistantApp:
             return self._do_search(intent.label)
         if intent.type == IntentType.FORGET:
             if intent.label and self.memory.delete_object(intent.label):
+                st = self.memory.stats()
+                self.stats.mem_objects = st["objects"]
+                self._refresh_mem_info()
                 return f"好的，我已经忘记{intent.label}了。"
             return f"没有找到叫{intent.label or '它'}的记忆。"
         if intent.type == IntentType.LIST:
             objs = self.memory.list_objects()
             if not objs:
-                return "我还没有记住任何物品。你可以对我说：记住，这个叫……"
+                return "我还没有录入任何物品。你可以对我说：记住，这个叫……"
             names = "、".join(o.user_name for o in objs[:8])
             more = f"等共{len(objs)}个物品" if len(objs) > 8 else ""
-            return f"我记住了：{names}{more}。"
+            return f"我录入了：{names}{more}。"
         if intent.type == IntentType.HELP:
-            return "你可以问：这是什么？教我记住这个叫……，或者说：帮我找我的水杯。"
+            return (
+                "你可以问：这是什么？教我记住这个叫……；"
+                "按 O 可选择本地图片识别，按 L 查看已录入物品。"
+            )
         return "我没太听懂，可以说：这是什么？"
 
-    def _extract_bundle(
-        self,
-        frame: np.ndarray,
-        crop: np.ndarray,
-        box: tuple[int, int, int, int],
-    ) -> FeatureBundle:
-        """DINO + OpenCV shape + monocular depth for one crop (intent thread only)."""
-        bundle = FeatureBundle()
-        if getattr(self.dino, "ready", False):
-            e, ms = self.dino.timed_embed(crop)
-            self.stats.dino_latency_ms = ms
-            bundle.dino = e
-        if self.shape.enabled:
-            sv, _ = self.shape.timed_extract(crop, box)
-            bundle.shape = sv
-        if self.depth.ready:
-            dv, _ = self.depth.timed_extract(crop, frame_bgr=frame, box=box)
-            bundle.depth = dv
-        return bundle
+    # ----------------------------------------------------------- embed
+    def _embed_crop(self, crop: np.ndarray) -> Optional[np.ndarray]:
+        """ResNet18 feature for one crop (intent thread only)."""
+        if not getattr(self.resnet, "ready", False):
+            return None
+        e, ms = self.resnet.timed_embed(crop)
+        self.stats.embed_latency_ms = ms
+        return e
+
+    def _describe_known(self, m: MemoryMatch) -> str:
+        pct = int(round(m.score * 100))
+        name = m.user_name.strip()
+        if name.startswith("我的") or name.startswith("你的") or name.startswith("他的"):
+            base = f"这是{name}"
+        else:
+            base = f"这是你的{name}"
+        self.stats.last_similarity = m.score
+        return f"{base}，相似度{pct}%。"
+
+    def _describe_unknown(self, m: Optional[MemoryMatch]) -> str:
+        thr = int(round(self.memory.threshold * 100))
+        if m is None:
+            self.stats.last_similarity = 0.0
+            if self.memory.stats()["objects"] == 0:
+                return "未知物体。特征库还是空的，先说：记住，这个叫……"
+            return "未知物体。"
+        pct = int(round(m.score * 100))
+        self.stats.last_similarity = m.score
+        return f"未知物体，最相似的{m.user_name}只有{pct}%（阈值{thr}%）。"
 
     # ---------------------------------------------------------- identify
     def _do_identify(self) -> str:
         frame, _ = self.camera.latest()
         if frame is None:
             return "摄像头还没有画面。"
+        if not getattr(self.resnet, "ready", False):
+            return "ResNet18 特征模型未加载，无法识别。请运行 tools/prepare_models.py --resnet18。"
+
         dets = self._current_detections()
-        h, w = frame.shape[:2]
-        dino_ok = getattr(self.dino, "ready", False)
+        best: Optional[MemoryMatch] = None
+        best_box: Optional[tuple] = None
 
-        # 1) YOLO detections → crop each → multi-channel memory
+        # 1) YOLO boxes → embed each → best cosine over the bank
         if dets:
-            if not dino_ok:
-                top = dets[0]
-                return (
-                    f"检测到{self._cnn_to_zh(top.label)}（YOLO），"
-                    "但特征模型 DINO 未加载，无法匹配记忆。请用 vision_ai 环境运行。"
-                )
-            crops = self.cropper.crop_detections(frame, dets)
-            embeds: List[Optional[np.ndarray]] = []
-            shapes: List[Optional[np.ndarray]] = []
-            depths: List[Optional[np.ndarray]] = []
-            for crop, box, det in crops:
+            for crop, box, det in self.cropper.crop_detections(frame, dets):
                 if not self.cropper.quality_ok(crop):
-                    embeds.append(None)
-                    shapes.append(None)
-                    depths.append(None)
                     continue
-                b = self._extract_bundle(frame, crop, box)
-                embeds.append(b.dino)
-                shapes.append(b.shape)
-                depths.append(b.depth)
-            match = self.memory.match_detections(embeds, shapes, depths)
-            if match is not None:
-                idx, m = match
-                box = crops[idx][1]
-                self._flash_match(box, m.user_name, m.score)
-                return self._reframe_known(m.user_name)
-            # no memory → generic YOLO name
-            top = dets[0]
-            return f"这是一个{self._cnn_to_zh(top.label)}。"
+                emb = self._embed_crop(crop)
+                if emb is None:
+                    continue
+                m = self.memory.best_match(emb)
+                if m and (best is None or m.score > best.score):
+                    best, best_box = m, box
 
-        # 2) no YOLO box → central ROI (unknown object)
-        if not dino_ok:
-            return "特征模型 DINO 未加载，无法识别记忆中的物品。请用 vision_ai 环境运行。"
-        box = self.cropper.center_roi(frame)
-        crop = self.cropper.crop_box(frame, box)
-        if not self.cropper.quality_ok(crop):
-            return "我看不清这个物品，试着把它放到画面中央亮一点。"
-        b = self._extract_bundle(frame, crop, box)
-        if b.any:
-            m = self.memory.best_match(b.dino, shape_embedding=b.shape, depth_embedding=b.depth)
-            if m is not None:
-                self._flash_match(box, m.user_name, m.score)
-                return self._reframe_known(m.user_name)
-        return "我还不认识这个物品。你可以教我：记住，这个叫……"
+        # 2) center ROI fallback (also the main path when YOLO is off)
+        if best is None:
+            box = self.cropper.center_roi(frame)
+            crop = self.cropper.crop_box(frame, box)
+            if not self.cropper.quality_ok(crop):
+                return "我看不清这个物品，试着把它放到画面中央亮一点。"
+            emb = self._embed_crop(crop)
+            if emb is None:
+                return "特征提取失败，请检查 ResNet18 模型。"
+            best = self.memory.best_match(emb)
+            best_box = box
 
-    @staticmethod
-    def _reframe_known(name: str) -> str:
-        n = name.strip()
-        if n.startswith("我的") or n.startswith("你的") or n.startswith("他的"):
-            return f"这是{n}。"
-        return f"这是你的{n}。"
+        if best is None or best.score < self.memory.threshold:
+            if best_box is not None and best is not None:
+                self._flash_match(best_box, "未知物体", best.score)
+            return self._describe_unknown(best)
+
+        if best_box is not None:
+            self._flash_match(best_box, best.user_name, best.score)
+        return self._describe_known(best)
 
     # ----------------------------------------------------------- remember
     def _do_remember(self, label: str) -> str:
         if not label:
             return "你想给它起什么名字？请说：记住，这个叫……"
-        if not getattr(self.dino, "ready", False):
+        if not getattr(self.resnet, "ready", False):
             return (
-                "视觉特征模型没有加载（DINO 未就绪），无法记住物品。"
-                "请用 conda activate vision_ai 运行。"
+                "ResNet18 特征模型没有加载，无法录入物品。"
+                "请运行 python tools/prepare_models.py --resnet18 后重试。"
             )
         mem_cfg = self.cfg.get("memory", {})
         duration = float(mem_cfg.get("sample_duration_sec", 2.5))
@@ -480,14 +468,13 @@ class AssistantApp:
 
         self.stats.mode = "remember"
         self._overlay.learning = True
-        self._overlay.learning_label = f"学习模式：{label}"
+        self._overlay.learning_label = f"录入模式：{label}"
         self._overlay.learning_progress = 0.0
 
         t_end = time.time() + duration
         t_next = time.time()
         samples: List[tuple[np.ndarray, tuple[int, int, int, int], str]] = []
-        seen_embeds: List[np.ndarray] = []
-        seen_bundles: List[FeatureBundle] = []
+        embeds: List[np.ndarray] = []
         generic_guess = ""
 
         while time.time() < t_end and len(samples) < max_samples and self._running:
@@ -504,154 +491,176 @@ class AssistantApp:
                 if not self.cropper.quality_ok(crop):
                     time.sleep(0.02)
                     continue
-                b = self._extract_bundle(frame, crop, box)
-                if b.dino is None:
+                emb = self._embed_crop(crop)
+                if emb is None:
                     continue
-                e = b.dino
                 # diversity filter — never starve min_samples on a static scene
                 force = len(samples) < min_samples
-                if seen_embeds and not force:
-                    sims = [float(e @ s) for s in seen_embeds]
+                if embeds and not force:
+                    sims = [float(emb @ s) for s in embeds]
                     if max(sims) > 0.995:
                         time.sleep(0.02)
                         continue
-                # record generic class from best center det
                 if source == "yolo" and not generic_guess:
-                    best = self.cropper.best_center_detection(dets, frame)
-                    if best is not None:
-                        generic_guess = best.label
-                seen_embeds.append(e)
-                seen_bundles.append(b)
+                    dets_now = self._current_detections()
+                    best_det = self.cropper.best_center_detection(dets_now, frame)
+                    if best_det is not None:
+                        generic_guess = best_det.label
+                embeds.append(emb)
                 samples.append((crop, box, source))
-                # draw last box
                 self._overlay.match_box = np.array(box, dtype=np.float32)
             time.sleep(0.02)
 
         self._overlay.learning_progress = 1.0
         if len(samples) < min_samples:
             self._overlay.learning = False
-            if not getattr(self.dino, "ready", False):
+            if not getattr(self.resnet, "ready", False):
                 return f"特征模型未加载，没有记住{label}。请用 vision_ai 环境重试。"
-            return f"采样不足（{len(samples)}/{min_samples}），没有记住{label}。请把物体稳定放在中央区域，稍亮一些再试。"
+            return (
+                f"采样不足（{len(samples)}/{min_samples}），没有记住{label}。"
+                "请把物体稳定放在中央区域，稍亮一些再试。"
+            )
 
-        # persist
+        # persist images + ResNet18 features
         obj_dir = os.path.join(self.cfg["memory"]["samples_dir"], _safe_name(label))
         os.makedirs(obj_dir, exist_ok=True)
-        emb_list = []
-        shape_list = []
-        depth_list = []
         paths = []
         for i, (crop, box, source) in enumerate(samples):
             p = os.path.join(obj_dir, f"s{i:02d}.png")
             cv2.imwrite(p, crop)
-            b = seen_bundles[i]
-            emb_list.append(b.dino)
-            shape_list.append(b.shape)
-            depth_list.append(b.depth)
             paths.append(p)
-        self.memory.add_object(
-            label,
-            generic_guess or None,
-            emb_list,
-            paths,
-            shape_embeddings=shape_list,
-            depth_embeddings=depth_list,
-        )
+        self.memory.add_object(label, generic_guess or None, embeds, paths)
+        st2 = self.memory.stats()
         self.stats.mem_objects = st2["objects"]
-        n_ch = 1 + int(st2["shape_shape"][0] > 0) + int(st2["depth_shape"][0] > 0)
         self.stats.mem_info = (
-            f"memory {self.stats.mem_objects} objs / {st2['samples']} samples / {n_ch}ch"
+            f"bank {self.stats.mem_objects} objs / {st2['samples']} samples / ResNet18-512d"
         )
         self._overlay.learning = False
         self._overlay.match_box = None
-        return f"好的，我已经记住{label}了。"
+        return f"好的，我已经记住{label}了（{len(samples)}张图片，ResNet18特征）。"
 
     # ------------------------------------------------------------- search
     def _do_search(self, label: str) -> str:
         if not label:
             return "你要找什么？请说：帮我找……"
+        if not getattr(self.resnet, "ready", False):
+            return "ResNet18 未加载，无法检索。"
         if self.memory.stats()["objects"] == 0 and not self._current_detections():
-            return (
-                f"记忆里还没有物品，画面里也暂未检测到{label}。"
-                "可先：记住，这个叫……"
-            )
+            return f"特征库还是空的，画面里也暂未检测到{label}。可先：记住，这个叫……"
+
         frame, _ = self.camera.latest()
         if frame is None:
             return "摄像头还没有画面。"
         h, w = frame.shape[:2]
         obj = self.memory.find_by_name(label)
         dets = self._current_detections()
-        if not obj and self.memory.stats()["objects"] == 0 and not dets:
-            return f"画面里没有检测到{label}。记忆是空的，可先记住它。"
 
-        # Scan strategy:
-        #  a) if label matches a remembered object → DINO every YOLO box (and center ROI)
-        #  b) else treat label as generic class name filter on YOLO
         best_box = None
         best_score = -1.0
         best_mem: Optional[MemoryMatch] = None
 
         if dets:
-            crops = self.cropper.crop_detections(frame, dets)
-            for crop, box, det in crops:
+            for crop, box, det in self.cropper.crop_detections(frame, dets):
                 if not self.cropper.quality_ok(crop):
                     continue
-                # generic class shortcut
-                if not obj and _zh_match(label, det.label):
-                    score = 0.99
-                    if score > best_score:
-                        best_score, best_box = score, box
+                emb = self._embed_crop(crop)
+                if emb is None:
                     continue
-                b = self._extract_bundle(frame, crop, box)
-                if not b.any:
-                    continue
-                m = self.memory.best_match(
-                    b.dino, shape_embedding=b.shape, depth_embedding=b.depth
-                )
+                m = self.memory.best_match(emb)
                 if m is None:
                     continue
-                # name similarity: matched object name should relate to query label
                 if _name_related(label, m.user_name) or (obj and m.object_id == obj.object_id):
                     if m.score > best_score:
                         best_score = m.score
                         best_box = box
                         best_mem = m
 
-        # center ROI fallback (unknown object sitting in middle)
         if best_box is None:
             box = self.cropper.center_roi(frame)
             crop = self.cropper.crop_box(frame, box)
             if self.cropper.quality_ok(crop):
-                b = self._extract_bundle(frame, crop, box)
-                if b.any:
-                    m = self.memory.best_match(
-                        b.dino, shape_embedding=b.shape, depth_embedding=b.depth
-                    )
-                    if m and (_name_related(label, m.user_name) or (obj and m.object_id == obj.object_id)):
+                emb = self._embed_crop(crop)
+                if emb is not None:
+                    m = self.memory.best_match(emb)
+                    if m and (
+                        _name_related(label, m.user_name)
+                        or (obj and m.object_id == obj.object_id)
+                    ):
                         best_box = box
                         best_score = m.score
                         best_mem = m
 
         if best_box is None:
-            if not getattr(self.dino, "ready", False):
-                return f"画面里没有检测到{label}，且 DINO 未加载，无法查记忆。请用 vision_ai 环境。"
             if self.memory.stats()["objects"] == 0:
-                return f"画面里没有检测到{label}。记忆是空的，可先：记住，这个叫……"
+                return f"画面里没有检测到{label}。特征库是空的，可先：记住，这个叫……"
             return f"画面里没有找到{label}。"
         pos = describe_position(best_box, w, h)
         name = best_mem.user_name if best_mem else label
         self._flash_match(best_box, name, max(best_score, 0.0))
         n = name.strip()
+        pct = int(round(max(best_score, 0.0) * 100))
         if n.startswith("我的") or n.startswith("你的"):
-            return f"找到{n}了，在{pos}。"
-        return f"找到你的{n}了，在{pos}。"
+            return f"找到{n}了，在{pos}（相似度{pct}%）。"
+        return f"找到你的{n}了，在{pos}（相似度{pct}%）。"
+
+    # ------------------------------------------------------- local image
+    def recognize_image_file(self, path: str) -> str:
+        """Recognize one local image (选题一: 本地图片输入). Thread-safe."""
+        if not getattr(self.resnet, "ready", False):
+            return "ResNet18 特征模型未加载，无法识别本地图片。"
+        img = cv2.imread(path)
+        if img is None:
+            return f"无法读取图片：{os.path.basename(path)}"
+        emb, ms = self.resnet.timed_embed(img)
+        self.stats.embed_latency_ms = ms
+        if emb is None:
+            return "特征提取失败，换一张图片试试。"
+        m = self.memory.best_match(emb)
+        if m is None or m.score < self.memory.threshold:
+            reply = self._describe_unknown(m)
+        else:
+            reply = self._describe_known(m)
+        log.info("recognize_file %s → %s", os.path.basename(path), reply)
+        return reply
+
+    def enroll_from_paths(self, label: str, paths: List[str]) -> str:
+        """Enroll an object from local image files (batch / CLI)."""
+        if not label:
+            return "缺少物体名称。"
+        if not getattr(self.resnet, "ready", False):
+            return "ResNet18 特征模型未加载，无法录入。"
+        min_samples = int(self.cfg.get("memory", {}).get("min_samples", 3))
+        obj_dir = os.path.join(self.cfg["memory"]["samples_dir"], _safe_name(label))
+        os.makedirs(obj_dir, exist_ok=True)
+        embeds: List[np.ndarray] = []
+        saved: List[str] = []
+        for i, src in enumerate(paths):
+            img = cv2.imread(src)
+            if img is None:
+                log.warning("unreadable image skipped: %s", src)
+                continue
+            emb = self.resnet.embed(img)
+            if emb is None:
+                continue
+            dest = os.path.join(obj_dir, f"s{len(embeds):02d}.png")
+            cv2.imwrite(dest, img)
+            embeds.append(emb)
+            saved.append(dest)
+        if len(embeds) < min_samples:
+            return (
+                f"录入失败：有效图片 {len(embeds)}/{len(paths)}，至少需要 {min_samples} 张。"
+            )
+        self.memory.add_object(label, None, embeds, saved)
+        st = self.memory.stats()
+        self.stats.mem_objects = st["objects"]
+        self._refresh_mem_info()
+        return f"好的，我已经记住{label}了（{len(embeds)}张图片，ResNet18特征）。"
 
     # ------------------------------------------------------------- utils
     def _flash_match(self, box, label: str, score: float) -> None:
         self._overlay.highlight = [(np.asarray(box, dtype=np.float32), label, float(score))]
         self._overlay.match_box = np.asarray(box, dtype=np.float32)
         self._overlay.match_label = label
-        # clear after 4s via timestamp
         self._flash_until = time.time() + 4.0
 
     def say(self, text: str) -> None:
@@ -663,25 +672,17 @@ class AssistantApp:
         self._last_subtitle = text
         self._subtitle_until = time.time() + seconds
 
-    @staticmethod
-    def _cnn_to_zh(label: str) -> str:
-        mapping = {
-            "cup": "杯子", "bottle": "瓶子", "cell phone": "手机", "mouse": "鼠标",
-            "keyboard": "键盘", "laptop": "笔记本电脑", "book": "书", "chair": "椅子",
-            "cat": "猫", "dog": "狗", "apple": "苹果", "person": "人", "tv": "电视",
-            "remote": "遥控器", "scissors": "剪刀", "teddy bear": "泰迪熊",
-            "banana": "香蕉", "orange": "橙子", "bowl": "碗", "knife": "刀",
-            "fork": "叉子", "spoon": "勺子", "sink": "水槽", "refrigerator": "冰箱",
-            "microwave": "微波炉", "oven": "烤箱", "toothbrush": "牙刷", "vase": "花瓶",
-            "clock": "时钟", "potted plant": "盆栽", "bed": "床", "couch": "沙发",
-            "dining table": "餐桌", "toilet": "马桶", "backpack": "背包", "umbrella": "伞",
-            "handbag": "手提包", "suitcase": "行李箱", "tie": "领带", "suitcase": "行李箱",
-        }
-        return mapping.get(label, label)
+    def _refresh_mem_info(self) -> None:
+        st = self.memory.stats()
+        thr = int(round(st.get("threshold", self.memory.threshold) * 100))
+        self.stats.mem_info = (
+            f"bank {st['objects']} objs / {st['samples']} samples | "
+            f"ResNet18 {self.resnet.device_used} | thr {thr}%"
+        )
 
     # ---------------------------------------------------------------- ui
     def run_ui(self) -> None:
-        win = "Offline Vision Voice Assistant"
+        win = "Object Recognition Demo (ResNet18)"
         if not self.headless:
             cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         ui_target = float(self.cfg.get("app", {}).get("ui_fps_target", 30))
@@ -693,7 +694,6 @@ class AssistantApp:
             while self._running:
                 t0 = time.perf_counter()
                 if self._need_text_input:
-                    # mic failed in voice thread → open IME window on UI thread once
                     if not getattr(self, "_text_fix_announced", False):
                         self._ensure_text_input()
                         self._text_fix_announced = True
@@ -704,19 +704,24 @@ class AssistantApp:
                     time.sleep(0.01)
                     continue
 
-                # clear expired highlight
-                if hasattr(self, "_flash_until") and time.time() > self._flash_until:
+                if time.time() > self._flash_until:
                     self._overlay.highlight = []
                     self._overlay.match_box = None
 
                 self._overlay.detections = self._current_detections()
                 self._overlay.fps = fps_ema
-                self._overlay.status_line = self.stats.last_reply or "就绪 — 说“这是什么？”或用文本框输入"
+                self._overlay.status_line = (
+                    self.stats.last_reply
+                    or "就绪 — 说“这是什么？” / 按 O 识别本地图片 / 按 L 查看列表"
+                )
                 self._overlay.det_info = self.stats.det_info
-                self._overlay.mem_info = self.stats.mem_info or f"memory {self.memory.stats()['objects']} objs | DINO {self.dino.device_used} | shape/depth multi-ch"
-                self._overlay.subtitle = self._last_subtitle if time.time() < self._subtitle_until else ""
+                if not self.stats.mem_info:
+                    self._refresh_mem_info()
+                self._overlay.mem_info = self.stats.mem_info
+                self._overlay.subtitle = (
+                    self._last_subtitle if time.time() < self._subtitle_until else ""
+                )
 
-                # text input bar: prefer Tk live/echo, else in-frame buffer
                 self._overlay.input_visible = self._text_input_enabled
                 if self.text_input is not None and self.text_input.available:
                     live = self.text_input.display_text
@@ -751,7 +756,6 @@ class AssistantApp:
                     fps_ema = inst if fps_ema == 0 else 0.9 * fps_ema + 0.1 * inst
                 self.stats.ui_fps = fps_ema
 
-                # pace to target
                 elapsed = time.perf_counter() - t0
                 sleep_t = frame_dt - elapsed
                 if sleep_t > 0 and not self.headless:
@@ -789,12 +793,10 @@ class AssistantApp:
             if key == 9:  # Tab — leave focus
                 self._cv_input_focused = False
                 return True
-            # printable ASCII
             if 32 <= key < 127:
                 if len(self._cv_input_buf) < 120:
                     self._cv_input_buf += chr(key)
                 return True
-            # other keys ignored while typing (so i/r/s don't fire)
             return True
 
         # ---- shortcuts when not typing ----
@@ -813,9 +815,42 @@ class AssistantApp:
             self.inject_text("帮我找测试物品")
         elif key == ord("l"):
             self.inject_text("你记住了什么")
+        elif key == ord("o"):
+            self._pick_and_recognize_file()
         elif key == ord("h"):
-            log.info("keys: q=quit  t//=text box  i=identify  r=remember  s=search  l=list")
+            log.info(
+                "keys: q=quit  t//=text box  i=identify  r=remember  "
+                "s=search  l=list  o=open image"
+            )
         return True
+
+    def _pick_and_recognize_file(self) -> None:
+        """Open a file dialog on the UI thread, recognize the chosen image, speak."""
+        path = ""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            path = filedialog.askopenfilename(
+                title="选择要识别的图片",
+                filetypes=[
+                    ("Images", "*.jpg *.jpeg *.png *.bmp *.webp"),
+                    ("All files", "*.*"),
+                ],
+            )
+            root.destroy()
+        except Exception as e:
+            log.warning("file dialog failed: %s", e)
+            return
+        if not path:
+            return
+        reply = self.recognize_image_file(path)
+        self.stats.last_reply = reply
+        self._set_subtitle(f"助手：{reply}", 5.0)
+        self._mic_muted_until = time.time() + min(8.0, 1.0 + 0.18 * len(reply))
+        self.tts.say_async(reply)
 
 
 def _safe_name(name: str) -> str:
@@ -829,83 +864,6 @@ def _safe_name(name: str) -> str:
     return s[:48]
 
 
-# Chinese query → COCO English labels (substring match both ways)
-_ZH_COCO_ALIASES: dict[str, tuple[str, ...]] = {
-    "显示器": ("tv", "laptop", "monitor"),
-    "显示屏": ("tv", "laptop", "monitor"),
-    "屏幕": ("tv", "laptop", "monitor", "cell phone"),
-    "电脑": ("laptop", "tv", "keyboard", "mouse"),
-    "笔记本电脑": ("laptop",),
-    "笔记本": ("laptop",),
-    "电视机": ("tv",),
-    "电视": ("tv",),
-    "手机": ("cell phone",),
-    "鼠标": ("mouse",),
-    "键盘": ("keyboard",),
-    "杯子": ("cup", "bottle"),
-    "水杯": ("cup", "bottle"),
-    "瓶子": ("bottle",),
-    "罐子": ("bottle",),
-    "笔": ("pen", "toothbrush"),  # pens often mis-labeled toothbrush
-    "签字笔": ("pen", "toothbrush"),
-    "圆珠笔": ("pen", "toothbrush"),
-    "书": ("book",),
-    "书本": ("book",),
-    "椅子": ("chair",),
-    "凳子": ("chair",),
-    "猫": ("cat",),
-    "狗": ("dog",),
-    "苹果": ("apple",),
-    "人": ("person",),
-    "手机": ("cell phone",),
-    "书包": ("backpack",),
-    "背包": ("backpack",),
-    "剪刀": ("scissors",),
-    "花瓶": ("vase",),
-    "时钟": ("clock",),
-    "钟": ("clock",),
-    "遥控器": ("remote",),
-    "冰箱": ("refrigerator",),
-    "微波炉": ("microwave",),
-    "烤箱": ("oven",),
-    "水槽": ("sink",),
-    "马桶": ("toilet",),
-    "沙发": ("couch",),
-    "床": ("bed",),
-    "盆栽": ("potted plant",),
-    "盆景": ("potted plant",),
-    "牙刷": ("toothbrush",),
-    "碗": ("bowl",),
-    "刀": ("knife",),
-    "叉子": ("fork",),
-    "勺子": ("spoon",),
-    "盘子": ("bowl", "sink"),
-    "泰迪熊": ("teddy bear",),
-    "玩偶": ("teddy bear",),
-    "雨伞": ("umbrella",),
-    "伞": ("umbrella",),
-    "领带": ("tie",),
-    "公文包": ("handbag", "suitcase"),
-    "行李箱": ("suitcase",),
-    "包": ("handbag", "backpack", "suitcase"),
-}
-
-
-def _zh_match(query: str, label: str) -> bool:
-    zh = AssistantApp._cnn_to_zh(label)
-    q = query.replace("我的", "").replace("这个", "").strip()
-    if q == label or q == zh or q in zh or zh in q or label in query:
-        return True
-    # synonym: Chinese query → any COCO alias matching this det label
-    for cq, aliases in _ZH_COCO_ALIASES.items():
-        if cq == q or cq in q or q in cq:
-            for a in aliases:
-                if a == label or a == zh:
-                    return True
-    # reverse: English label stem in Chinese aliases of query
-    return False
-
-
 def _name_related(query: str, stored: str) -> bool:
     q = query.replace("我的", "").strip()
     s = stored.replace("我的", "").strip()
@@ -913,6 +871,5 @@ def _name_related(query: str, stored: str) -> bool:
         return True
     if q == s or q in s or s in q:
         return True
-    # token overlap for Chinese (char bigram-ish)
     inter = len(set(q) & set(s))
     return inter >= max(1, min(len(q), len(s)) // 2)

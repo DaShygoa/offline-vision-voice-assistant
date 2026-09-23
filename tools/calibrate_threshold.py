@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Calibrate memory.match_threshold from real similarity data (spec §10).
+"""Calibrate memory.match_threshold from real similarity data (选题一 unknown judgment).
 
 Collects cosine scores for:
   * same object, different views
@@ -49,7 +49,7 @@ def load_pairs_from_memory() -> Tuple[List[float], List[float]]:
     negatives: List[float] = []
 
     for obj in objs:
-        # gather this object's embeddings from disk
+        # gather this object's ResNet18 embeddings from disk
         rows = mem._conn.execute(
             "SELECT image_path FROM object_samples WHERE object_id=?", (obj.object_id,)
         ).fetchall()
@@ -59,7 +59,8 @@ def load_pairs_from_memory() -> Tuple[List[float], List[float]]:
             if p and os.path.isfile(p + ".npy"):
                 e = np.load(p + ".npy").astype(np.float32)
                 e /= max(1e-8, float(np.linalg.norm(e)))
-                embs.append(e)
+                if e.shape[0] == mem.embed_dim:
+                    embs.append(e)
         if not embs:
             continue
         for e in embs:
@@ -70,6 +71,7 @@ def load_pairs_from_memory() -> Tuple[List[float], List[float]]:
             others = [s.score for s in mem.query(e, topk=20) if s.object_id != obj.object_id]
             if others:
                 negatives.append(max(others))
+    mem.close()
     return positives, negatives
 
 

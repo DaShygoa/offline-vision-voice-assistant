@@ -1,6 +1,6 @@
 from .camera import Camera
 from .detector import YoloDetector, Detection
-from .feature_extractor import DinoExtractor
+from .feature_extractor import ResNet18Extractor
 from .object_cropper import ObjectCropper
 from .position import describe_position
 from .visualizer import Visualizer
@@ -10,7 +10,7 @@ __all__ = [
     "Camera",
     "YoloDetector",
     "Detection",
-    "DinoExtractor",
+    "ResNet18Extractor",
     "ObjectCropper",
     "describe_position",
     "Visualizer",

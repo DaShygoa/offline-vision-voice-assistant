@@ -9,7 +9,8 @@ app:
   text_input_always: false     # true = open IME window even with mic
 
 # ---------------------------------------------------------------------------
-# YOLO — OpenVINO primary (Intel iGPU -> CPU), OpenCV DNN fallback. NO CUDA.
+# YOLO (optional ROI helper) — OpenVINO primary, OpenCV DNN fallback. NO CUDA.
+# Only proposes crop boxes; identity always comes from ResNet18 retrieval.
 # ---------------------------------------------------------------------------
 yolo:
   enabled: true
@@ -27,65 +28,41 @@ yolo:
   class_filter: null           # null = all COCO classes, or list e.g. [0, 41, 43]
 
 # ---------------------------------------------------------------------------
-# DINOv2 ViT-S/14 — instance-level visual embedding. OpenVINO / ONNX Runtime.
-# Only runs on identify / remember / search. Never in the camera hot path.
+# ResNet18 (ImageNet pretrained) — 选题一 feature extractor.
+# avgpool 512-d, L2-normalized, cosine retrieval. OpenVINO / ONNX Runtime.
+# Only runs on identify / remember / search — never camera hot path.
+# Prep: python tools/prepare_models.py --resnet18
 # ---------------------------------------------------------------------------
-dino:
+resnet18:
   enabled: true
   backend: openvino            # openvino | onnxruntime
-  model_path: models/dinov2_vits14/dinov2_vits14.onnx
-  device: GPU
-  allow_cpu_fallback: true
-  precision: FP16              # FP32 | FP16
-  input_size: 224
-  embed_dim: 384
-
-# ---------------------------------------------------------------------------
-# Shape — classical OpenCV silhouette descriptor (Hu / Fourier / geometry).
-# Side-channel next to DINO; never concatenated into the 384-d matrix.
-# ---------------------------------------------------------------------------
-shape:
-  enabled: true
-  use_hu: true
-  use_fourier: true
-  min_side: 32
-
-# ---------------------------------------------------------------------------
-# Depth — monocular depth signature (MiDaS small ONNX). OpenVINO / ONNX Runtime.
-# Only on remember / identify / search — never camera hot path.
-# ---------------------------------------------------------------------------
-depth:
-  enabled: true
-  backend: openvino            # openvino | onnxruntime
-  model_path: models/midas/model-small.onnx
+  model_path: models/resnet18/resnet18_openvino_model/resnet18.xml
+  onnx_path: models/resnet18/resnet18.onnx
   device: GPU
   allow_cpu_fallback: true
   precision: FP16
-  input_size: 256
+  input_size: 224
+  embed_dim: 512
 
 # ---------------------------------------------------------------------------
-# Visual memory — MVP: NumPy cosine similarity (no FAISS).
-# Fused score = w_dino*dino + w_shape*shape + w_depth*depth (renormalized).
+# Object feature library — NumPy cosine similarity (no FAISS).
+# known  : best score >= match_threshold → name + similarity
+# unknown: best score <  match_threshold → 未知物体
+# Calibrate: python tools/calibrate_threshold.py --compute
 # ---------------------------------------------------------------------------
 memory:
   db_path: data/visual_memory.db
   samples_dir: data/samples
-  embeddings_path: data/embeddings.npz
-  match_threshold: 0.75        # CALIBRATE with tools/calibrate_threshold.py
+  embeddings_path: data/resnet18_embeddings.npz
+  match_threshold: 0.65
   topk: 3
   min_samples: 3
   max_samples: 10
   sample_duration_sec: 2.5
   sample_interval_ms: 250
   min_crop_px: 64
-  # unknown-object learning uses central ROI when YOLO has no reliable box
+  # enrollment / identify uses central ROI when YOLO has no reliable box
   center_roi_frac: 0.45
-  # multi-channel fusion
-  use_shape: true
-  use_depth: true
-  weight_dino: 0.55
-  weight_shape: 0.30
-  weight_depth: 0.15
 
 # ---------------------------------------------------------------------------
 # ASR — sherpa-onnx Paraformer Chinese, CPU INT8 + Silero/sherpa VAD

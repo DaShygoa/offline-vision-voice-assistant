@@ -1,11 +1,6 @@
-"""Classical shape descriptor — pure OpenCV, no model, fully offline.
+"""Legacy classical shape descriptor — NOT wired in 选题一 (ResNet18 only).
 
-Produces a compact L2-normalized vector from a crop + optional YOLO box:
-  * silhouette cues: contours, Hu moments, solidity, extent, circularity
-  * bbox geometry: aspect, fill ratio, orientation
-  * optional Fourier descriptors of the largest contour
-
-Used as a side-channel next to DINOv2 — never concatenated into the 384-d matrix.
+Kept for reference; core/app.py no longer imports this module.
 """
 
 from __future__ import annotations

@@ -1,14 +1,6 @@
-"""Monocular depth feature extractor — OpenVINO / ONNX Runtime, no PyTorch at runtime.
+"""Legacy monocular depth feature extractor — NOT wired in 选题一 (ResNet18 only).
 
-Runs only on remember / identify / search (never camera hot path).
-
-Input : crop BGR (or full frame + box crop already applied)
-Output: compact L2-normalized depth signature (not a full map in memory):
-  * relative depth stats inside the object box (mean/median/std/gradient)
-  * histogram (8 bins) of normalized inverse-depth (near→bright)
-  * depth contrast vs ring around the box (object vs surround)
-
-If no model file is present, `ready=False` and callers skip depth gracefully.
+Kept for reference; core/app.py no longer imports this module.
 """
 
 from __future__ import annotations

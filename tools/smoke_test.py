@@ -26,6 +26,8 @@ def main() -> int:
 
     cfg = load_config()
     print("[1] config OK", list(cfg.keys()))
+    assert "resnet18" in cfg, "config must contain resnet18 section"
+    assert "dino" not in cfg, "dino section should be removed for 选题一"
 
     # 2) NLU
     from nlu.intent import IntentType, parse_intent
@@ -45,7 +47,7 @@ def main() -> int:
             ok = False
         print(f"[2] '{text}' → {got.type.value} label={got.label!r} {status}")
 
-    # 3) memory roundtrip — multi-channel (dino + shape + depth fusion)
+    # 3) feature bank roundtrip — single-channel ResNet18 cosine retrieval
     from vision.memory import VisualMemory
 
     mem = VisualMemory(
@@ -54,88 +56,43 @@ def main() -> int:
             "samples_dir": os.path.join(tempfile.gettempdir(), "smoke_samples"),
             "embeddings_path": os.path.join(tempfile.gettempdir(), "smoke_emb.npz"),
             "match_threshold": 0.5,
-            "use_shape": True,
-            "use_depth": True,
-            "weight_dino": 0.55,
-            "weight_shape": 0.30,
-            "weight_depth": 0.15,
+            "embed_dim": 512,
         }
     )
-    dim = 384
+    dim = 512
     base = np.random.randn(dim).astype(np.float32)
     base /= np.linalg.norm(base)
     emb_near = base + 0.01 * np.random.randn(dim).astype(np.float32)
     emb_near /= np.linalg.norm(emb_near)
     emb_far = np.random.randn(dim).astype(np.float32)
     emb_far /= np.linalg.norm(emb_far)
-    shape_base = np.random.randn(32).astype(np.float32)
-    shape_base /= np.linalg.norm(shape_base)
-    shape_near = shape_base + 0.02 * np.random.randn(32).astype(np.float32)
-    shape_near /= np.linalg.norm(shape_near)
-    depth_base = np.random.randn(18).astype(np.float32)
-    depth_base /= np.linalg.norm(depth_base)
-    depth_near = depth_base + 0.05 * np.random.randn(18).astype(np.float32)
-    depth_near /= np.linalg.norm(depth_near)
-    mem.add_object(
-        "测试杯子",
-        "cup",
-        [base, emb_near],
-        [],
-        shape_embeddings=[shape_base, shape_near],
-        depth_embeddings=[depth_base, depth_near],
-    )
-    m = mem.best_match(emb_near, shape_embedding=shape_near, depth_embedding=depth_near)
+    # second object for ranking
+    base2 = np.random.randn(dim).astype(np.float32)
+    base2 /= np.linalg.norm(base2)
+    mem.add_object("测试杯子", "cup", [base, emb_near], [])
+    mem.add_object("测试书本", "book", [base2], [])
+    m = mem.best_match(emb_near)
     if m is None or "测试杯子" not in m.user_name:
         ok = False
         print("[3] memory match FAIL", m)
     else:
-        print(
-            f"[3] fused match OK score={m.score:.3f} "
-            f"dino={m.score_dino if m.score_dino is not None else 0:.3f} "
-            f"shape={m.score_shape if m.score_shape is not None else 0:.3f} "
-            f"depth={m.score_depth if m.score_depth is not None else 0:.3f} "
-            f"→ {m.user_name}"
-        )
+        print(f"[3] cosine match OK score={m.score:.3f} → {m.user_name}")
         st = mem.stats()
-        if st["shape_shape"][0] < 2 or st["depth_shape"][0] < 2:
+        if st["matrix_shape"][0] < 3 or st["matrix_shape"][1] != 512:
             ok = False
-            print("[3] multi-channel index FAIL", st)
+            print("[3] feature bank FAIL", st)
         else:
-            print(f"[3] multi-channel OK shape={st['shape_shape']} depth={st['depth_shape']}")
+            print(f"[3] feature bank OK matrix={st['matrix_shape']}")
+    # unknown judgment: low-score query must be below threshold
     m2 = mem.best_match(emb_far)
-    print(f"[3] far query score={(m2.score if m2 else 0):.3f} (may still match at low thr)")
+    if m2 is not None and m2.score >= mem.threshold:
+        # random high-dim vectors are usually ~0 cosine; if not, still report
+        print(f"[3] far query score={m2.score:.3f} >= thr (random vectors rare case)")
+    else:
+        sc = m2.score if m2 else 0.0
+        print(f"[3] unknown judgment OK score={sc:.3f} < thr={mem.threshold}")
     mem.delete_object("测试杯子")
     mem.close()
-
-    # 3b) shape descriptor + depth extractor
-    from vision.depth import DepthExtractor
-    from vision.shape_descriptor import ShapeDescriptor
-
-    sh = ShapeDescriptor(cfg.get("shape", {}))
-    # synthetic: dark square on light bg
-    syn = np.full((160, 160, 3), 220, dtype=np.uint8)
-    syn[40:120, 40:120] = 30
-    sv = sh.extract(syn, box=(40, 40, 120, 120))
-    if sv is None or sv.shape[0] != sh.dim:
-        ok = False
-        print(f"[3b] shape FAIL dim={sh.dim} sv={None if sv is None else sv.shape}")
-    else:
-        print(f"[3b] shape OK dim={sh.dim} L2={float(np.linalg.norm(sv)):.3f}")
-
-    depth = DepthExtractor(cfg.get("depth", {}))
-    try:
-        depth.load()
-        if depth.ready:
-            dv, ms = depth.timed_extract(syn, frame_bgr=syn, box=(40, 40, 120, 120))
-            if dv is None or dv.shape[0] != depth.dim:
-                ok = False
-                print(f"[3b] depth FAIL dv={None if dv is None else dv.shape}")
-            else:
-                print(f"[3b] depth OK device={depth.device_used} dim={depth.dim} {ms:.1f}ms")
-        else:
-            print(f"[3b] depth SKIP ({depth._error or 'disabled'})")
-    except Exception as e:
-        print(f"[3b] depth SKIP/FAIL: {e}")
 
     # 4) cropper / position / visualizer (headless draw)
     import cv2
@@ -154,7 +111,6 @@ def main() -> int:
     st = OverlayState(status_line="smoke", learning=True, learning_label="测试")
     out = viz.draw(frame, st)
     assert out.shape == frame.shape
-    # input bar draw (no-mic path)
     st2 = OverlayState(status_line="smoke", input_visible=True, input_focused=True, input_text="这是什么")
     out2 = viz.draw(frame, st2)
     assert out2.shape == frame.shape
@@ -166,9 +122,8 @@ def main() -> int:
     assert ti.display_text == "记住这个"
     print(f"[4] cropper/position/visualizer+input OK pos={pos}")
 
-    # 5) YOLO / DINO load if models present
+    # 5) YOLO load if models present (optional ROI helper)
     from vision.detector import YoloDetector
-    from vision.feature_extractor import DinoExtractor
 
     yolo = YoloDetector(cfg.get("yolo", {}))
     try:
@@ -178,13 +133,24 @@ def main() -> int:
     except Exception as e:
         print(f"[5] YOLO SKIP/FAIL: {e}")
 
-    dino = DinoExtractor(cfg.get("dino", {}))
+    # 6) ResNet18 load if model present (选题一 core)
+    from vision.feature_extractor import ResNet18Extractor
+
+    resnet = ResNet18Extractor(cfg.get("resnet18", {}))
     try:
-        dino.load()
-        e, dt = dino.timed_embed(crop)
-        print(f"[6] DINO OK device={dino.device_used} dim={0 if e is None else e.shape[0]} {dt:.1f}ms")
+        resnet.load()
+        e, dt = resnet.timed_embed(crop)
+        dim_ok = e is not None and e.shape[0] == 512
+        if not dim_ok:
+            ok = False
+        nrm = float(np.linalg.norm(e)) if e is not None else 0.0
+        print(
+            f"[6] ResNet18 OK device={resnet.device_used} "
+            f"dim={0 if e is None else e.shape[0]} L2={nrm:.3f} {dt:.1f}ms"
+        )
     except Exception as e:
-        print(f"[6] DINO SKIP/FAIL: {e}")
+        print(f"[6] ResNet18 SKIP/FAIL: {e}")
+        print("     run: python tools/prepare_models.py --resnet18")
 
     # 7) ASR load if present
     try:

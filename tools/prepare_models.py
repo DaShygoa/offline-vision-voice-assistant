@@ -2,14 +2,14 @@
 """One-time model preparation (requires internet ONCE — runtime stays fully offline).
 
 Downloads / converts:
-  1. YOLOv8n ONNX  → OpenVINO IR (xml/bin) for OpenVINO backend
-  2. DINOv2 ViT-S/14 ONNX (community export) for embedding
+  1. ResNet18 (ImageNet pretrained) ONNX → OpenVINO IR  ← 选题一 core feature model
+  2. YOLOv8n ONNX → OpenVINO IR (optional ROI helper)
   3. sherpa-onnx Paraformer Chinese INT8 + Silero VAD
   4. Optional note for GPT-SoVITS (installed separately)
 
 Usage:
     python tools/prepare_models.py --all
-    python tools/prepare_models.py --yolo --dino --asr
+    python tools/prepare_models.py --resnet18 --asr
     python tools/prepare_models.py --yolo-only-local path/to/yolov8n.onnx
 """
 
@@ -33,15 +33,8 @@ YOLOV8N_ONNX_DIRECT = [
     "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.onnx",
 ]
 
-# DINOv2 ViT-S/14 — export via torch.hub (one-time; runtime needs no torch)
-DINOV2_HUB = ("facebookresearch/dinov2", "dinov2_vits14")
-
-# MiDaS v2.1 small ONNX — monocular depth side-channel for shape memory
-MIDAS_SMALL_ONNX_URL = (
-    "https://github.com/isl-org/MiDaS/releases/download/v2_1/model-small.onnx"
-)
-
 # sherpa-onnx Paraformer Chinese (int8 e2e) + silero VAD release bundles
+
 SHERPA_PARAFORMER_INT8_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2023-09-14.tar.bz2"
 )
@@ -134,7 +127,8 @@ def prepare_yolo(local_onnx: str | None = None) -> str:
 
             os.makedirs(os.path.dirname(ir_xml), exist_ok=True)
             print("[cvrt] ONNX → OpenVINO IR …")
-            ov.convert_model(onnx_path, output_model=ir_xml)
+            ov_model = ov.convert_model(onnx_path)
+            ov.save_model(ov_model, ir_xml, compress_to_fp16=True)
             print(f"[ok ] {ir_xml}")
         except Exception as e:
             print(f"[warn] openvino convert failed: {e}")
@@ -144,52 +138,58 @@ def prepare_yolo(local_onnx: str | None = None) -> str:
     return onnx_path
 
 
-# --------------------------------------------------------------------- DINO
-def prepare_dino() -> str:
-    dino_dir = os.path.join(MODELS, "dinov2_vits14")
-    os.makedirs(dino_dir, exist_ok=True)
-    onnx_path = os.path.join(dino_dir, "dinov2_vits14.onnx")
-    if os.path.isfile(onnx_path) and os.path.getsize(onnx_path) > 10_000_000:
-        print(f"[skip] {onnx_path}")
-        return onnx_path
+# ----------------------------------------------------------------- ResNet18
+def prepare_resnet18() -> str:
+    """Export ImageNet-pretrained ResNet18 (avgpool 512-d) → ONNX → OpenVINO IR."""
+    rn_dir = os.path.join(MODELS, "resnet18")
+    os.makedirs(rn_dir, exist_ok=True)
+    onnx_path = os.path.join(rn_dir, "resnet18.onnx")
+    ir_xml = os.path.join(rn_dir, "resnet18_openvino_model", "resnet18.xml")
 
-    print("[exp ] export DINOv2 ViT-S/14 via torch.hub (one-time; temp torch) …")
-    try:
-        import torch
-        from torch import nn
+    if not (os.path.isfile(onnx_path) and os.path.getsize(onnx_path) > 10_000_000):
+        print("[exp ] export ResNet18 (ImageNet pretrained, fc→Identity) via torchvision …")
+        try:
+            import torch
+            from torchvision.models import ResNet18_Weights, resnet18
 
-        repo, name = DINOV2_HUB
-        model = torch.hub.load(repo, name)
-        model.eval()
+            model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            model.fc = torch.nn.Identity()  # 512-d avgpool feature
+            model.eval()
+            dummy = torch.randn(1, 3, 224, 224)
+            torch.onnx.export(
+                model,
+                dummy,
+                onnx_path,
+                input_names=["input"],
+                output_names=["feature"],
+                opset_version=17,
+                dynamo=False,
+                do_constant_folding=True,
+            )
+            print(f"[ok ] {onnx_path} ({os.path.getsize(onnx_path)} bytes)")
+        except Exception as e:
+            print(f"[err] ResNet18 torch export failed: {e}")
+            print(
+                "      Manual: place ResNet18 ONNX (input 1x3x224x224 → feature 1x512) at:\n"
+                f"      {onnx_path}"
+            )
+            return ""
 
-        class _W(nn.Module):
-            def __init__(self, m):
-                super().__init__()
-                self.m = m
+    if os.path.isfile(onnx_path) and not os.path.isfile(ir_xml):
+        try:
+            import openvino as ov
 
-            def forward(self, pixel_values):
-                return self.m.forward(pixel_values, masks=None)
-
-        w = _W(model)
-        dummy = torch.randn(1, 3, 224, 224)
-        torch.onnx.export(
-            w,
-            dummy,
-            onnx_path,
-            input_names=["pixel_values"],
-            output_names=["features"],
-            opset_version=17,
-            dynamo=False,
-            do_constant_folding=True,
-        )
-        print(f"[ok ] {onnx_path} ({os.path.getsize(onnx_path)} bytes)")
-        return onnx_path
-    except Exception as e:
-        print(f"[err] torch export failed: {e}")
-    print(
-        f"[manual] place DINOv2 ViT-S/14 ONNX (input 1x3x224x224 → output 1x384) at:\n         {onnx_path}"
-    )
-    return ""
+            os.makedirs(os.path.dirname(ir_xml), exist_ok=True)
+            print("[cvrt] ResNet18 ONNX → OpenVINO IR …")
+            ov_model = ov.convert_model(onnx_path)
+            ov.save_model(ov_model, ir_xml, compress_to_fp16=True)
+            print(f"[ok ] {ir_xml}")
+        except Exception as e:
+            print(f"[warn] openvino convert failed: {e}")
+            print("      ResNet18 can still run via onnxruntime backend with the ONNX file.")
+    if os.path.isfile(ir_xml):
+        print(f"[done] ResNet18 IR ready: {ir_xml}")
+    return onnx_path
 
 
 # ---------------------------------------------------------------------- ASR
@@ -287,46 +287,26 @@ def _prepare_vad() -> str:
     return vad_path
 
 
-def prepare_depth() -> str:
-    """MiDaS v2.1 small ONNX — monocular depth side-channel (one-time download)."""
-    depth_dir = os.path.join(MODELS, "midas")
-    os.makedirs(depth_dir, exist_ok=True)
-    path = os.path.join(depth_dir, "model-small.onnx")
-    if os.path.isfile(path) and os.path.getsize(path) > 10_000_000:
-        print(f"[skip] {path}")
-        return path
-    try:
-        _download(MIDAS_SMALL_ONNX_URL, path, "MiDaS small ONNX depth")
-        print(f"[ok ] depth model → {path}")
-    except Exception as e:
-        print(f"[err] depth download failed: {e}")
-        print(f"      Manual: place model-small.onnx at {path}")
-    return path
-
-
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--all", action="store_true")
-    p.add_argument("--yolo", action="store_true")
-    p.add_argument("--dino", action="store_true")
+    p.add_argument("--resnet18", action="store_true", help="export ImageNet ResNet18 (选题一)")
+    p.add_argument("--yolo", action="store_true", help="optional YOLOv8n ROI helper")
     p.add_argument("--asr", action="store_true")
-    p.add_argument("--depth", action="store_true", help="download MiDaS small ONNX for shape memory")
     p.add_argument("--yolo-only-local", default=None, help="use a local yolov8n.onnx path")
     args = p.parse_args(argv)
 
-    if not any([args.all, args.yolo, args.dino, args.asr, args.depth, args.yolo_only_local]):
+    if not any([args.all, args.resnet18, args.yolo, args.asr, args.yolo_only_local]):
         p.print_help()
         print("\nNOTE: GPT-SoVITS is installed separately — see voice/tts_server.py")
         return 0
 
+    if args.all or args.resnet18:
+        prepare_resnet18()
     if args.all or args.yolo or args.yolo_only_local:
         prepare_yolo(args.yolo_only_local)
-    if args.all or args.dino:
-        prepare_dino()
     if args.all or args.asr:
         prepare_asr()
-    if args.all or args.depth:
-        prepare_depth()
     print("\nAll requested model prep done. Runtime = fully offline.")
     print("GPT-SoVITS: clone/install separately, then:")
     print(r"  python -m voice.tts_server --gpt-sovits-path D:\GPT-SoVITS --port 19880")

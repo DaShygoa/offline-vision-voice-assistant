@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""benchmark.py — on-machine performance report (spec §14).
+"""benchmark.py — on-machine performance report (选题一).
 
 Measures:
-  * YOLO inference latency   (OpenVINO GPU/CPU, avg / p50 / p95)
-  * DINOv2 inference latency
-  * ASR latency              (Paraformer decode on synthetic/test wav)
-  * TTS RTF                  (GPT-SoVITS server or mock)
+  * ResNet18 inference latency  (OpenVINO GPU/CPU, avg / p50 / p95)
+  * YOLO inference latency      (optional ROI helper)
+  * ASR latency                 (Paraformer decode on synthetic/test wav)
+  * TTS RTF                     (GPT-SoVITS server or mock)
   * RAM (process / system), CPU %, iGPU device + utilization (best effort)
 
 Usage:
@@ -214,13 +214,13 @@ def bench_yolo(cfg: dict, runs: int, frame: np.ndarray) -> Dict[str, object]:
     }
 
 
-def bench_dino(cfg: dict, runs: int, frame: np.ndarray) -> Dict[str, object]:
-    from vision.feature_extractor import DinoExtractor
+def bench_resnet18(cfg: dict, runs: int, frame: np.ndarray) -> Dict[str, object]:
+    from vision.feature_extractor import ResNet18Extractor
     from vision.object_cropper import ObjectCropper
 
     cropper = ObjectCropper()
     crop = cropper.crop_box(frame, cropper.center_roi(frame))
-    ext = DinoExtractor(cfg.get("dino", {}))
+    ext = ResNet18Extractor(cfg.get("resnet18", {}))
     t_load = time.perf_counter()
     try:
         ext.load()
@@ -245,7 +245,7 @@ def bench_dino(cfg: dict, runs: int, frame: np.ndarray) -> Dict[str, object]:
         "embed_ok": ok,
         "embed_dim": int(emb.shape[0]) if emb is not None else 0,
         "latency": _stats(lat),
-        "note": "DINO runs only on identify/remember/search — not per frame",
+        "note": "ResNet18 runs only on identify/remember/search — not per frame",
     }
 
 
@@ -355,7 +355,7 @@ def bench_memory(cfg: dict) -> Dict[str, object]:
     mem = VisualMemory(cfg.get("memory", {}))
     st = mem.stats()
     # synthetic match latency
-    dim = 384
+    dim = int(cfg.get("memory", {}).get("embed_dim", 512))
     q = np.random.randn(dim).astype(np.float32)
     q /= max(1e-8, float(np.linalg.norm(q)))
     # inject a temporary object
@@ -375,7 +375,7 @@ def bench_memory(cfg: dict) -> Dict[str, object]:
             "objects": st["objects"],
             "samples": st["samples"],
             "query_latency": _stats(lat),
-            "backend": "numpy_cosine",
+            "backend": "numpy_cosine_resnet18",
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -385,9 +385,10 @@ def bench_memory(cfg: dict) -> Dict[str, object]:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="On-machine benchmark for offline vision-voice assistant")
     p.add_argument("--config", default=None)
-    p.add_argument("--runs", type=int, default=30, help="YOLO/DINO timed iterations")
+    p.add_argument("--runs", type=int, default=30, help="YOLO/ResNet18 timed iterations")
     p.add_argument("--skip-yolo", action="store_true")
-    p.add_argument("--skip-dino", action="store_true")
+    p.add_argument("--skip-resnet", action="store_true")
+    p.add_argument("--skip-dino", action="store_true", help="deprecated alias of --skip-resnet")
     p.add_argument("--skip-asr", action="store_true")
     p.add_argument("--skip-tts", action="store_true")
     p.add_argument("--skip-memory", action="store_true")
@@ -432,9 +433,9 @@ def main(argv=None) -> int:
     if not args.skip_yolo:
         log.info("Benchmarking YOLO …")
         report["yolo"] = bench_yolo(cfg, args.runs, frame)
-    if not args.skip_dino:
-        log.info("Benchmarking DINOv2 …")
-        report["dino"] = bench_dino(cfg, args.runs, frame)
+    if not (args.skip_resnet or args.skip_dino):
+        log.info("Benchmarking ResNet18 …")
+        report["resnet18"] = bench_resnet18(cfg, args.runs, frame)
     if not args.skip_memory:
         log.info("Benchmarking visual memory …")
         report["memory"] = bench_memory(cfg)
