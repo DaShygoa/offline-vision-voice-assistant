@@ -36,6 +36,11 @@ YOLOV8N_ONNX_DIRECT = [
 # DINOv2 ViT-S/14 — export via torch.hub (one-time; runtime needs no torch)
 DINOV2_HUB = ("facebookresearch/dinov2", "dinov2_vits14")
 
+# MiDaS v2.1 small ONNX — monocular depth side-channel for shape memory
+MIDAS_SMALL_ONNX_URL = (
+    "https://github.com/isl-org/MiDaS/releases/download/v2_1/model-small.onnx"
+)
+
 # sherpa-onnx Paraformer Chinese (int8 e2e) + silero VAD release bundles
 SHERPA_PARAFORMER_INT8_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2023-09-14.tar.bz2"
@@ -282,16 +287,34 @@ def _prepare_vad() -> str:
     return vad_path
 
 
+def prepare_depth() -> str:
+    """MiDaS v2.1 small ONNX — monocular depth side-channel (one-time download)."""
+    depth_dir = os.path.join(MODELS, "midas")
+    os.makedirs(depth_dir, exist_ok=True)
+    path = os.path.join(depth_dir, "model-small.onnx")
+    if os.path.isfile(path) and os.path.getsize(path) > 10_000_000:
+        print(f"[skip] {path}")
+        return path
+    try:
+        _download(MIDAS_SMALL_ONNX_URL, path, "MiDaS small ONNX depth")
+        print(f"[ok ] depth model → {path}")
+    except Exception as e:
+        print(f"[err] depth download failed: {e}")
+        print(f"      Manual: place model-small.onnx at {path}")
+    return path
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--all", action="store_true")
     p.add_argument("--yolo", action="store_true")
     p.add_argument("--dino", action="store_true")
     p.add_argument("--asr", action="store_true")
+    p.add_argument("--depth", action="store_true", help="download MiDaS small ONNX for shape memory")
     p.add_argument("--yolo-only-local", default=None, help="use a local yolov8n.onnx path")
     args = p.parse_args(argv)
 
-    if not any([args.all, args.yolo, args.dino, args.asr, args.yolo_only_local]):
+    if not any([args.all, args.yolo, args.dino, args.asr, args.depth, args.yolo_only_local]):
         p.print_help()
         print("\nNOTE: GPT-SoVITS is installed separately — see voice/tts_server.py")
         return 0
@@ -302,7 +325,8 @@ def main(argv=None) -> int:
         prepare_dino()
     if args.all or args.asr:
         prepare_asr()
-
+    if args.all or args.depth:
+        prepare_depth()
     print("\nAll requested model prep done. Runtime = fully offline.")
     print("GPT-SoVITS: clone/install separately, then:")
     print(r"  python -m voice.tts_server --gpt-sovits-path D:\GPT-SoVITS --port 19880")

@@ -45,7 +45,7 @@ def main() -> int:
             ok = False
         print(f"[2] '{text}' → {got.type.value} label={got.label!r} {status}")
 
-    # 3) memory roundtrip
+    # 3) memory roundtrip — multi-channel (dino + shape + depth fusion)
     from vision.memory import VisualMemory
 
     mem = VisualMemory(
@@ -54,6 +54,11 @@ def main() -> int:
             "samples_dir": os.path.join(tempfile.gettempdir(), "smoke_samples"),
             "embeddings_path": os.path.join(tempfile.gettempdir(), "smoke_emb.npz"),
             "match_threshold": 0.5,
+            "use_shape": True,
+            "use_depth": True,
+            "weight_dino": 0.55,
+            "weight_shape": 0.30,
+            "weight_depth": 0.15,
         }
     )
     dim = 384
@@ -63,17 +68,74 @@ def main() -> int:
     emb_near /= np.linalg.norm(emb_near)
     emb_far = np.random.randn(dim).astype(np.float32)
     emb_far /= np.linalg.norm(emb_far)
-    mem.add_object("测试杯子", "cup", [base, emb_near], [])
-    m = mem.best_match(emb_near)
+    shape_base = np.random.randn(32).astype(np.float32)
+    shape_base /= np.linalg.norm(shape_base)
+    shape_near = shape_base + 0.02 * np.random.randn(32).astype(np.float32)
+    shape_near /= np.linalg.norm(shape_near)
+    depth_base = np.random.randn(18).astype(np.float32)
+    depth_base /= np.linalg.norm(depth_base)
+    depth_near = depth_base + 0.05 * np.random.randn(18).astype(np.float32)
+    depth_near /= np.linalg.norm(depth_near)
+    mem.add_object(
+        "测试杯子",
+        "cup",
+        [base, emb_near],
+        [],
+        shape_embeddings=[shape_base, shape_near],
+        depth_embeddings=[depth_base, depth_near],
+    )
+    m = mem.best_match(emb_near, shape_embedding=shape_near, depth_embedding=depth_near)
     if m is None or "测试杯子" not in m.user_name:
         ok = False
         print("[3] memory match FAIL", m)
     else:
-        print(f"[3] memory match OK score={m.score:.3f} → {m.user_name}")
+        print(
+            f"[3] fused match OK score={m.score:.3f} "
+            f"dino={m.score_dino if m.score_dino is not None else 0:.3f} "
+            f"shape={m.score_shape if m.score_shape is not None else 0:.3f} "
+            f"depth={m.score_depth if m.score_depth is not None else 0:.3f} "
+            f"→ {m.user_name}"
+        )
+        st = mem.stats()
+        if st["shape_shape"][0] < 2 or st["depth_shape"][0] < 2:
+            ok = False
+            print("[3] multi-channel index FAIL", st)
+        else:
+            print(f"[3] multi-channel OK shape={st['shape_shape']} depth={st['depth_shape']}")
     m2 = mem.best_match(emb_far)
     print(f"[3] far query score={(m2.score if m2 else 0):.3f} (may still match at low thr)")
     mem.delete_object("测试杯子")
     mem.close()
+
+    # 3b) shape descriptor + depth extractor
+    from vision.depth import DepthExtractor
+    from vision.shape_descriptor import ShapeDescriptor
+
+    sh = ShapeDescriptor(cfg.get("shape", {}))
+    # synthetic: dark square on light bg
+    syn = np.full((160, 160, 3), 220, dtype=np.uint8)
+    syn[40:120, 40:120] = 30
+    sv = sh.extract(syn, box=(40, 40, 120, 120))
+    if sv is None or sv.shape[0] != sh.dim:
+        ok = False
+        print(f"[3b] shape FAIL dim={sh.dim} sv={None if sv is None else sv.shape}")
+    else:
+        print(f"[3b] shape OK dim={sh.dim} L2={float(np.linalg.norm(sv)):.3f}")
+
+    depth = DepthExtractor(cfg.get("depth", {}))
+    try:
+        depth.load()
+        if depth.ready:
+            dv, ms = depth.timed_extract(syn, frame_bgr=syn, box=(40, 40, 120, 120))
+            if dv is None or dv.shape[0] != depth.dim:
+                ok = False
+                print(f"[3b] depth FAIL dv={None if dv is None else dv.shape}")
+            else:
+                print(f"[3b] depth OK device={depth.device_used} dim={depth.dim} {ms:.1f}ms")
+        else:
+            print(f"[3b] depth SKIP ({depth._error or 'disabled'})")
+    except Exception as e:
+        print(f"[3b] depth SKIP/FAIL: {e}")
 
     # 4) cropper / position / visualizer (headless draw)
     import cv2
@@ -92,7 +154,17 @@ def main() -> int:
     st = OverlayState(status_line="smoke", learning=True, learning_label="测试")
     out = viz.draw(frame, st)
     assert out.shape == frame.shape
-    print(f"[4] cropper/position/visualizer OK pos={pos}")
+    # input bar draw (no-mic path)
+    st2 = OverlayState(status_line="smoke", input_visible=True, input_focused=True, input_text="这是什么")
+    out2 = viz.draw(frame, st2)
+    assert out2.shape == frame.shape
+    from ui.text_input import TextInputWindow
+
+    ti = TextInputWindow(on_submit=lambda t: None)
+    assert ti.display_text == "" and not ti.is_typing
+    ti.set_echo("记住这个")
+    assert ti.display_text == "记住这个"
+    print(f"[4] cropper/position/visualizer+input OK pos={pos}")
 
     # 5) YOLO / DINO load if models present
     from vision.detector import YoloDetector

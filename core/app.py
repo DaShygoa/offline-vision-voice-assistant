@@ -32,6 +32,10 @@ from vision.memory import MemoryMatch, VisualMemory
 from vision.object_cropper import ObjectCropper
 from vision.position import describe_position
 from vision.visualizer import OverlayState, Visualizer
+from vision.shape_descriptor import ShapeDescriptor
+from vision.depth import DepthExtractor
+from vision.features import FeatureBundle
+from ui.text_input import TextInputWindow
 from voice.asr import ParaformerASR
 from voice.mic import MicStream
 from voice.tts import TtsClient
@@ -74,7 +78,13 @@ class AssistantApp:
         )
         self.detector = YoloDetector(cfg.get("yolo", {}))
         self.dino = DinoExtractor(cfg.get("dino", {}))
-        self.memory = VisualMemory(cfg.get("memory", {}))
+        self.shape = ShapeDescriptor(cfg.get("shape", {}))
+        self.depth = DepthExtractor(cfg.get("depth", {}))
+        mem_cfg = dict(cfg.get("memory", {}))
+        # keep fusion flags consistent with extractors
+        mem_cfg.setdefault("use_shape", self.shape.enabled)
+        mem_cfg.setdefault("use_depth", self.depth.enabled)
+        self.memory = VisualMemory(mem_cfg)
         self.cropper = ObjectCropper(
             center_roi_frac=float(cfg.get("memory", {}).get("center_roi_frac", 0.45)),
             min_crop_px=int(cfg.get("memory", {}).get("min_crop_px", 64)),
@@ -99,6 +109,29 @@ class AssistantApp:
         self._mic_muted_until = 0.0  # avoid hearing our own TTS (simple half-duplex)
         self._learning_boxes: List[np.ndarray] = []
 
+        # text command input (no-microphone fallback)
+        app_cfg = cfg.get("app", {})
+        self._text_input_enabled = bool(app_cfg.get("text_input", True)) and not headless
+        self._text_input_always = bool(app_cfg.get("text_input_always", False))
+        self.text_input: Optional[TextInputWindow] = None
+        self._cv_input_focused = False
+        self._cv_input_buf = ""
+        self._cv_input_placeholder = "输入指令… (t/Enter 聚焦，回车发送，Esc 取消)"
+        self._need_text_input = False
+
+    def _ensure_text_input(self) -> None:
+        """Open the Tk IME window once (idempotent). Call from UI/main thread."""
+        if not self._text_input_enabled or self.headless:
+            return
+        if self.text_input is not None and self.text_input.available:
+            return
+        win = TextInputWindow(on_submit=self.inject_text)
+        if win.start():
+            self.text_input = win
+        else:
+            log.info("Falling back to in-frame OpenCV text input (press t)")
+        self._need_text_input = False
+
     # ----------------------------------------------------------------- boot
     def start(self) -> None:
         log.info("Loading models …")
@@ -107,6 +140,30 @@ class AssistantApp:
             self.dino.load()
         except Exception as e:
             log.error("DINO failed to load (identify/remember degraded): %s", e)
+            self._dino_error = str(e)
+        if not getattr(self.dino, "ready", False):
+            if "No module named" in str(getattr(self, "_dino_error", "")) or self.dino.device_used == "none":
+                log.error(
+                    "提示: 识别/记忆需要 DINO + onnxruntime/openvino。"
+                    " 请用 conda activate vision_ai 后再运行。"
+                )
+        # shape (pure OpenCV) + depth (MiDaS) side channels
+        try:
+            self.depth.load()
+        except Exception as e:
+            log.warning("Depth load failed (depth channel off): %s", e)
+        if self.depth.ready:
+            log.info("Depth ready: %s dim=%d", self.depth.device_used, self.depth.dim)
+        else:
+            log.info("Depth channel off (%s)", self.depth._error or "disabled")
+        log.info(
+            "Shape ready: enabled=%s dim=%d fusion w=[dino %.2f shape %.2f depth %.2f]",
+            self.shape.enabled,
+            self.shape.dim,
+            self.memory.w_dino,
+            self.memory.w_shape,
+            self.memory.w_depth,
+        )
         if self.use_voice:
             try:
                 self.asr.load()
@@ -116,6 +173,14 @@ class AssistantApp:
                 self.use_voice = False
         self.tts.start()
         self.camera.start()
+
+        # text box: always if no mic, or if user asked for it
+        if self._text_input_enabled and (self._text_input_always or not self.use_voice):
+            self._ensure_text_input()
+            self._overlay.input_visible = True
+        elif self._text_input_enabled:
+            # with mic: still show bar, Tk window optional (off unless text_input_always)
+            self._overlay.input_visible = True
 
         self._running = True
         self._threads = [
@@ -130,13 +195,29 @@ class AssistantApp:
         st = self.memory.stats()
         self.stats.mem_objects = st["objects"]
         self.stats.tts_health = self.tts.health()
-        log.info("Started. memory=%s yolo=%s dino=%s tts=%s", st, self.detector.device_used, self.dino.device_used, self.stats.tts_health)
-        self.say("视觉助手已启动。")
+        log.info(
+            "Started. memory=%s yolo=%s dino=%s shape=%s depth=%s tts=%s voice=%s text_input=%s",
+            st,
+            self.detector.device_used,
+            self.dino.device_used,
+            "on" if self.shape.enabled else "off",
+            self.depth.device_used if self.depth.ready else "off",
+            self.stats.tts_health,
+            self.use_voice,
+            "ime" if self.text_input else ("frame" if self._text_input_enabled else "off"),
+        )
+        if not self.use_voice:
+            self.say("未检测到麦克风，可使用文本输入框发送指令。")
+        else:
+            self.say("视觉助手已启动。")
 
     def stop(self) -> None:
         self._running = False
         for t in self._threads:
             t.join(timeout=2.0)
+        if self.text_input is not None:
+            self.text_input.stop()
+            self.text_input = None
         self.camera.stop()
         self.tts.stop()
         if self.use_voice:
@@ -182,7 +263,9 @@ class AssistantApp:
     # ------------------------------------------------------------- voice
     def _voice_loop(self) -> None:
         if not self.mic.start():
-            log.warning("Mic unavailable — voice disabled, use keyboard mode")
+            log.warning("Mic unavailable — voice disabled, enable text input")
+            self.use_voice = False
+            self._need_text_input = True  # opened on UI thread
             return
         sr = self.mic.sample_rate
         buf: List[np.ndarray] = []
@@ -297,6 +380,26 @@ class AssistantApp:
             return "你可以问：这是什么？教我记住这个叫……，或者说：帮我找我的水杯。"
         return "我没太听懂，可以说：这是什么？"
 
+    def _extract_bundle(
+        self,
+        frame: np.ndarray,
+        crop: np.ndarray,
+        box: tuple[int, int, int, int],
+    ) -> FeatureBundle:
+        """DINO + OpenCV shape + monocular depth for one crop (intent thread only)."""
+        bundle = FeatureBundle()
+        if getattr(self.dino, "ready", False):
+            e, ms = self.dino.timed_embed(crop)
+            self.stats.dino_latency_ms = ms
+            bundle.dino = e
+        if self.shape.enabled:
+            sv, _ = self.shape.timed_extract(crop, box)
+            bundle.shape = sv
+        if self.depth.ready:
+            dv, _ = self.depth.timed_extract(crop, frame_bgr=frame, box=box)
+            bundle.depth = dv
+        return bundle
+
     # ---------------------------------------------------------- identify
     def _do_identify(self) -> str:
         frame, _ = self.camera.latest()
@@ -304,19 +407,31 @@ class AssistantApp:
             return "摄像头还没有画面。"
         dets = self._current_detections()
         h, w = frame.shape[:2]
+        dino_ok = getattr(self.dino, "ready", False)
 
-        # 1) YOLO detections → crop each → DINO → memory
+        # 1) YOLO detections → crop each → multi-channel memory
         if dets:
+            if not dino_ok:
+                top = dets[0]
+                return (
+                    f"检测到{self._cnn_to_zh(top.label)}（YOLO），"
+                    "但特征模型 DINO 未加载，无法匹配记忆。请用 vision_ai 环境运行。"
+                )
             crops = self.cropper.crop_detections(frame, dets)
-            embeds = []
+            embeds: List[Optional[np.ndarray]] = []
+            shapes: List[Optional[np.ndarray]] = []
+            depths: List[Optional[np.ndarray]] = []
             for crop, box, det in crops:
                 if not self.cropper.quality_ok(crop):
                     embeds.append(None)
+                    shapes.append(None)
+                    depths.append(None)
                     continue
-                e, ms = self.dino.timed_embed(crop)
-                self.stats.dino_latency_ms = ms
-                embeds.append(e)
-            match = self.memory.match_detections(embeds)
+                b = self._extract_bundle(frame, crop, box)
+                embeds.append(b.dino)
+                shapes.append(b.shape)
+                depths.append(b.depth)
+            match = self.memory.match_detections(embeds, shapes, depths)
             if match is not None:
                 idx, m = match
                 box = crops[idx][1]
@@ -327,14 +442,15 @@ class AssistantApp:
             return f"这是一个{self._cnn_to_zh(top.label)}。"
 
         # 2) no YOLO box → central ROI (unknown object)
+        if not dino_ok:
+            return "特征模型 DINO 未加载，无法识别记忆中的物品。请用 vision_ai 环境运行。"
         box = self.cropper.center_roi(frame)
         crop = self.cropper.crop_box(frame, box)
         if not self.cropper.quality_ok(crop):
             return "我看不清这个物品，试着把它放到画面中央亮一点。"
-        e, ms = self.dino.timed_embed(crop)
-        self.stats.dino_latency_ms = ms
-        if e is not None:
-            m = self.memory.best_match(e)
+        b = self._extract_bundle(frame, crop, box)
+        if b.any:
+            m = self.memory.best_match(b.dino, shape_embedding=b.shape, depth_embedding=b.depth)
             if m is not None:
                 self._flash_match(box, m.user_name, m.score)
                 return self._reframe_known(m.user_name)
@@ -351,6 +467,11 @@ class AssistantApp:
     def _do_remember(self, label: str) -> str:
         if not label:
             return "你想给它起什么名字？请说：记住，这个叫……"
+        if not getattr(self.dino, "ready", False):
+            return (
+                "视觉特征模型没有加载（DINO 未就绪），无法记住物品。"
+                "请用 conda activate vision_ai 运行。"
+            )
         mem_cfg = self.cfg.get("memory", {})
         duration = float(mem_cfg.get("sample_duration_sec", 2.5))
         interval = float(mem_cfg.get("sample_interval_ms", 250)) / 1000.0
@@ -366,6 +487,7 @@ class AssistantApp:
         t_next = time.time()
         samples: List[tuple[np.ndarray, tuple[int, int, int, int], str]] = []
         seen_embeds: List[np.ndarray] = []
+        seen_bundles: List[FeatureBundle] = []
         generic_guess = ""
 
         while time.time() < t_end and len(samples) < max_samples and self._running:
@@ -382,10 +504,10 @@ class AssistantApp:
                 if not self.cropper.quality_ok(crop):
                     time.sleep(0.02)
                     continue
-                e, ms = self.dino.timed_embed(crop)
-                self.stats.dino_latency_ms = ms
-                if e is None:
+                b = self._extract_bundle(frame, crop, box)
+                if b.dino is None:
                     continue
+                e = b.dino
                 # diversity filter — never starve min_samples on a static scene
                 force = len(samples) < min_samples
                 if seen_embeds and not force:
@@ -399,6 +521,7 @@ class AssistantApp:
                     if best is not None:
                         generic_guess = best.label
                 seen_embeds.append(e)
+                seen_bundles.append(b)
                 samples.append((crop, box, source))
                 # draw last box
                 self._overlay.match_box = np.array(box, dtype=np.float32)
@@ -407,21 +530,38 @@ class AssistantApp:
         self._overlay.learning_progress = 1.0
         if len(samples) < min_samples:
             self._overlay.learning = False
-            return f"采样不足，没有记住{label}。请把物体稳定放在中央区域再试一次。"
+            if not getattr(self.dino, "ready", False):
+                return f"特征模型未加载，没有记住{label}。请用 vision_ai 环境重试。"
+            return f"采样不足（{len(samples)}/{min_samples}），没有记住{label}。请把物体稳定放在中央区域，稍亮一些再试。"
 
         # persist
         obj_dir = os.path.join(self.cfg["memory"]["samples_dir"], _safe_name(label))
         os.makedirs(obj_dir, exist_ok=True)
         emb_list = []
+        shape_list = []
+        depth_list = []
         paths = []
         for i, (crop, box, source) in enumerate(samples):
             p = os.path.join(obj_dir, f"s{i:02d}.png")
             cv2.imwrite(p, crop)
-            emb_list.append(seen_embeds[i])
+            b = seen_bundles[i]
+            emb_list.append(b.dino)
+            shape_list.append(b.shape)
+            depth_list.append(b.depth)
             paths.append(p)
-        self.memory.add_object(label, generic_guess or None, emb_list, paths)
-        self.stats.mem_objects = self.memory.stats()["objects"]
-        self.stats.mem_info = f"memory {self.stats.mem_objects} objs / {self.memory.stats()['samples']} samples"
+        self.memory.add_object(
+            label,
+            generic_guess or None,
+            emb_list,
+            paths,
+            shape_embeddings=shape_list,
+            depth_embeddings=depth_list,
+        )
+        self.stats.mem_objects = st2["objects"]
+        n_ch = 1 + int(st2["shape_shape"][0] > 0) + int(st2["depth_shape"][0] > 0)
+        self.stats.mem_info = (
+            f"memory {self.stats.mem_objects} objs / {st2['samples']} samples / {n_ch}ch"
+        )
         self._overlay.learning = False
         self._overlay.match_box = None
         return f"好的，我已经记住{label}了。"
@@ -430,12 +570,19 @@ class AssistantApp:
     def _do_search(self, label: str) -> str:
         if not label:
             return "你要找什么？请说：帮我找……"
+        if self.memory.stats()["objects"] == 0 and not self._current_detections():
+            return (
+                f"记忆里还没有物品，画面里也暂未检测到{label}。"
+                "可先：记住，这个叫……"
+            )
         frame, _ = self.camera.latest()
         if frame is None:
             return "摄像头还没有画面。"
         h, w = frame.shape[:2]
         obj = self.memory.find_by_name(label)
         dets = self._current_detections()
+        if not obj and self.memory.stats()["objects"] == 0 and not dets:
+            return f"画面里没有检测到{label}。记忆是空的，可先记住它。"
 
         # Scan strategy:
         #  a) if label matches a remembered object → DINO every YOLO box (and center ROI)
@@ -455,11 +602,12 @@ class AssistantApp:
                     if score > best_score:
                         best_score, best_box = score, box
                     continue
-                e, ms = self.dino.timed_embed(crop)
-                self.stats.dino_latency_ms = ms
-                if e is None:
+                b = self._extract_bundle(frame, crop, box)
+                if not b.any:
                     continue
-                m = self.memory.best_match(e)
+                m = self.memory.best_match(
+                    b.dino, shape_embedding=b.shape, depth_embedding=b.depth
+                )
                 if m is None:
                     continue
                 # name similarity: matched object name should relate to query label
@@ -474,15 +622,21 @@ class AssistantApp:
             box = self.cropper.center_roi(frame)
             crop = self.cropper.crop_box(frame, box)
             if self.cropper.quality_ok(crop):
-                e, _ = self.dino.timed_embed(crop)
-                if e is not None:
-                    m = self.memory.best_match(e)
+                b = self._extract_bundle(frame, crop, box)
+                if b.any:
+                    m = self.memory.best_match(
+                        b.dino, shape_embedding=b.shape, depth_embedding=b.depth
+                    )
                     if m and (_name_related(label, m.user_name) or (obj and m.object_id == obj.object_id)):
                         best_box = box
                         best_score = m.score
                         best_mem = m
 
         if best_box is None:
+            if not getattr(self.dino, "ready", False):
+                return f"画面里没有检测到{label}，且 DINO 未加载，无法查记忆。请用 vision_ai 环境。"
+            if self.memory.stats()["objects"] == 0:
+                return f"画面里没有检测到{label}。记忆是空的，可先：记住，这个叫……"
             return f"画面里没有找到{label}。"
         pos = describe_position(best_box, w, h)
         name = best_mem.user_name if best_mem else label
@@ -534,11 +688,17 @@ class AssistantApp:
         frame_dt = 1.0 / max(1.0, ui_target)
         fps_ema = 0.0
         last_ui = time.time()
-        key_help = "keys: q=quit  i=identify  r=remember  s=search  t=text command"
 
         try:
             while self._running:
                 t0 = time.perf_counter()
+                if self._need_text_input:
+                    # mic failed in voice thread → open IME window on UI thread once
+                    if not getattr(self, "_text_fix_announced", False):
+                        self._ensure_text_input()
+                        self._text_fix_announced = True
+                        if not self.use_voice:
+                            self.stats.last_reply = "未检测到麦克风，请使用文本输入框发送指令"
                 frame, _ = self.camera.latest()
                 if frame is None:
                     time.sleep(0.01)
@@ -551,33 +711,35 @@ class AssistantApp:
 
                 self._overlay.detections = self._current_detections()
                 self._overlay.fps = fps_ema
-                self._overlay.status_line = self.stats.last_reply or "就绪 — 说“这是什么？”试试"
+                self._overlay.status_line = self.stats.last_reply or "就绪 — 说“这是什么？”或用文本框输入"
                 self._overlay.det_info = self.stats.det_info
-                self._overlay.mem_info = self.stats.mem_info or f"memory {self.memory.stats()['objects']} objs | DINO {self.dino.device_used}"
+                self._overlay.mem_info = self.stats.mem_info or f"memory {self.memory.stats()['objects']} objs | DINO {self.dino.device_used} | shape/depth multi-ch"
                 self._overlay.subtitle = self._last_subtitle if time.time() < self._subtitle_until else ""
+
+                # text input bar: prefer Tk live/echo, else in-frame buffer
+                self._overlay.input_visible = self._text_input_enabled
+                if self.text_input is not None and self.text_input.available:
+                    live = self.text_input.display_text
+                    self._overlay.input_text = live
+                    self._overlay.input_focused = self.text_input.is_typing
+                    if not live:
+                        self._overlay.input_placeholder = (
+                            "在文本窗输入中文并回车（无麦克风）"
+                            if not self.use_voice
+                            else "输入指令… 或用语音"
+                        )
+                else:
+                    self._overlay.input_text = self._cv_input_buf
+                    self._overlay.input_focused = self._cv_input_focused
+                    self._overlay.input_placeholder = self._cv_input_placeholder
 
                 vis = self._viz.draw(frame, self._overlay)
 
                 if not self.headless:
                     cv2.imshow(win, vis)
                     key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("q"), 27):
+                    if not self._handle_key(key):
                         break
-                    elif key == ord("i"):
-                        self.inject_text("这是什么")
-                    elif key == ord("r"):
-                        self.inject_text("记住这个叫测试物品")
-                    elif key == ord("s"):
-                        self.inject_text("帮我找测试物品")
-                    elif key == ord("t"):
-                        try:
-                            txt = input("command> ").strip()
-                            if txt:
-                                self.inject_text(txt)
-                        except EOFError:
-                            pass
-                    elif key == ord("h"):
-                        log.info(key_help)
                 else:
                     time.sleep(max(0.0, frame_dt - (time.perf_counter() - t0)))
 
@@ -601,6 +763,60 @@ class AssistantApp:
                 except Exception:
                     cv2.destroyAllWindows()
 
+    # ---------------------------------------------------------------- keys
+    def _handle_key(self, key: int) -> bool:
+        """Process one cv2.waitKey code. Returns False to quit."""
+        if key < 0 or key == 255:
+            return True
+
+        # ---- in-frame text box focused: type / edit / submit ----
+        if self._cv_input_focused:
+            if key in (13, 10):  # Enter
+                text = self._cv_input_buf.strip()
+                self._cv_input_buf = ""
+                self._cv_input_focused = False
+                if text:
+                    self.inject_text(text)
+                return True
+            if key == 27:  # Esc
+                self._cv_input_buf = ""
+                self._cv_input_focused = False
+                return True
+            if key in (8, 127):  # Backspace / Delete
+                if self._cv_input_buf:
+                    self._cv_input_buf = self._cv_input_buf[:-1]
+                return True
+            if key == 9:  # Tab — leave focus
+                self._cv_input_focused = False
+                return True
+            # printable ASCII
+            if 32 <= key < 127:
+                if len(self._cv_input_buf) < 120:
+                    self._cv_input_buf += chr(key)
+                return True
+            # other keys ignored while typing (so i/r/s don't fire)
+            return True
+
+        # ---- shortcuts when not typing ----
+        if key in (ord("q"), 27):
+            return False
+        if key in (ord("t"), ord("/"), 13, 10):  # focus text box
+            self._cv_input_focused = True
+            if key in (ord("t"), ord("/")):
+                self._cv_input_buf = ""
+            return True
+        if key == ord("i"):
+            self.inject_text("这是什么")
+        elif key == ord("r"):
+            self.inject_text("记住这个叫测试物品")
+        elif key == ord("s"):
+            self.inject_text("帮我找测试物品")
+        elif key == ord("l"):
+            self.inject_text("你记住了什么")
+        elif key == ord("h"):
+            log.info("keys: q=quit  t//=text box  i=identify  r=remember  s=search  l=list")
+        return True
+
 
 def _safe_name(name: str) -> str:
     keep = []
@@ -613,10 +829,81 @@ def _safe_name(name: str) -> str:
     return s[:48]
 
 
+# Chinese query → COCO English labels (substring match both ways)
+_ZH_COCO_ALIASES: dict[str, tuple[str, ...]] = {
+    "显示器": ("tv", "laptop", "monitor"),
+    "显示屏": ("tv", "laptop", "monitor"),
+    "屏幕": ("tv", "laptop", "monitor", "cell phone"),
+    "电脑": ("laptop", "tv", "keyboard", "mouse"),
+    "笔记本电脑": ("laptop",),
+    "笔记本": ("laptop",),
+    "电视机": ("tv",),
+    "电视": ("tv",),
+    "手机": ("cell phone",),
+    "鼠标": ("mouse",),
+    "键盘": ("keyboard",),
+    "杯子": ("cup", "bottle"),
+    "水杯": ("cup", "bottle"),
+    "瓶子": ("bottle",),
+    "罐子": ("bottle",),
+    "笔": ("pen", "toothbrush"),  # pens often mis-labeled toothbrush
+    "签字笔": ("pen", "toothbrush"),
+    "圆珠笔": ("pen", "toothbrush"),
+    "书": ("book",),
+    "书本": ("book",),
+    "椅子": ("chair",),
+    "凳子": ("chair",),
+    "猫": ("cat",),
+    "狗": ("dog",),
+    "苹果": ("apple",),
+    "人": ("person",),
+    "手机": ("cell phone",),
+    "书包": ("backpack",),
+    "背包": ("backpack",),
+    "剪刀": ("scissors",),
+    "花瓶": ("vase",),
+    "时钟": ("clock",),
+    "钟": ("clock",),
+    "遥控器": ("remote",),
+    "冰箱": ("refrigerator",),
+    "微波炉": ("microwave",),
+    "烤箱": ("oven",),
+    "水槽": ("sink",),
+    "马桶": ("toilet",),
+    "沙发": ("couch",),
+    "床": ("bed",),
+    "盆栽": ("potted plant",),
+    "盆景": ("potted plant",),
+    "牙刷": ("toothbrush",),
+    "碗": ("bowl",),
+    "刀": ("knife",),
+    "叉子": ("fork",),
+    "勺子": ("spoon",),
+    "盘子": ("bowl", "sink"),
+    "泰迪熊": ("teddy bear",),
+    "玩偶": ("teddy bear",),
+    "雨伞": ("umbrella",),
+    "伞": ("umbrella",),
+    "领带": ("tie",),
+    "公文包": ("handbag", "suitcase"),
+    "行李箱": ("suitcase",),
+    "包": ("handbag", "backpack", "suitcase"),
+}
+
+
 def _zh_match(query: str, label: str) -> bool:
     zh = AssistantApp._cnn_to_zh(label)
     q = query.replace("我的", "").replace("这个", "").strip()
-    return q == label or q == zh or q in zh or zh in q or label in query
+    if q == label or q == zh or q in zh or zh in q or label in query:
+        return True
+    # synonym: Chinese query → any COCO alias matching this det label
+    for cq, aliases in _ZH_COCO_ALIASES.items():
+        if cq == q or cq in q or q in cq:
+            for a in aliases:
+                if a == label or a == zh:
+                    return True
+    # reverse: English label stem in Chinese aliases of query
+    return False
 
 
 def _name_related(query: str, stored: str) -> bool:

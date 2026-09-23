@@ -4,6 +4,9 @@ app:
   height: 720
   ui_fps_target: 30
   locale: zh
+  # no-microphone text command box (Tk IME window + in-frame bar)
+  text_input: true
+  text_input_always: false     # true = open IME window even with mic
 
 # ---------------------------------------------------------------------------
 # YOLO — OpenVINO primary (Intel iGPU -> CPU), OpenCV DNN fallback. NO CUDA.
@@ -38,7 +41,31 @@ dino:
   embed_dim: 384
 
 # ---------------------------------------------------------------------------
+# Shape — classical OpenCV silhouette descriptor (Hu / Fourier / geometry).
+# Side-channel next to DINO; never concatenated into the 384-d matrix.
+# ---------------------------------------------------------------------------
+shape:
+  enabled: true
+  use_hu: true
+  use_fourier: true
+  min_side: 32
+
+# ---------------------------------------------------------------------------
+# Depth — monocular depth signature (MiDaS small ONNX). OpenVINO / ONNX Runtime.
+# Only on remember / identify / search — never camera hot path.
+# ---------------------------------------------------------------------------
+depth:
+  enabled: true
+  backend: openvino            # openvino | onnxruntime
+  model_path: models/midas/model-small.onnx
+  device: GPU
+  allow_cpu_fallback: true
+  precision: FP16
+  input_size: 256
+
+# ---------------------------------------------------------------------------
 # Visual memory — MVP: NumPy cosine similarity (no FAISS).
+# Fused score = w_dino*dino + w_shape*shape + w_depth*depth (renormalized).
 # ---------------------------------------------------------------------------
 memory:
   db_path: data/visual_memory.db
@@ -53,6 +80,12 @@ memory:
   min_crop_px: 64
   # unknown-object learning uses central ROI when YOLO has no reliable box
   center_roi_frac: 0.45
+  # multi-channel fusion
+  use_shape: true
+  use_depth: true
+  weight_dino: 0.55
+  weight_shape: 0.30
+  weight_depth: 0.15
 
 # ---------------------------------------------------------------------------
 # ASR — sherpa-onnx Paraformer Chinese, CPU INT8 + Silero/sherpa VAD

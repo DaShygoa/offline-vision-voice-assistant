@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -74,6 +75,11 @@ class OverlayState:
     det_info: str = ""
     mem_info: str = ""
     highlight: List[tuple[np.ndarray, str, float]] = field(default_factory=list)  # (box, label, conf)
+    # text input bar (no-microphone fallback)
+    input_visible: bool = True
+    input_focused: bool = False
+    input_text: str = ""
+    input_placeholder: str = "输入指令… (t / Enter 聚焦，回车发送，Esc 取消)"
 
 
 class Visualizer:
@@ -110,20 +116,68 @@ class Visualizer:
             tip = "保持物体在框内，可轻微转动"
             self._center_text(img, tip, y2 + 18, _GRAY, scale=0.5)
 
-        # status bar
-        cv2.rectangle(img, (0, h - 64), (w, h), _BG, -1)
+        # status bar (top strip) + input bar (bottom strip)
+        cv2.rectangle(img, (0, 0), (w, 48), _BG, -1)  # info bar at top
         if self.show_fps:
-            self._label(img, f"FPS {state.fps:.1f}", 10, h - 44, _WHITE, scale=0.55)
-        self._label(img, state.status_line, 10, h - 22, _WHITE, scale=0.6)
+            self._label(img, f"FPS {state.fps:.1f}", 10, 8, _WHITE, scale=0.5)
+        self._label(img, state.status_line, 10, 28, _WHITE, scale=0.55)
         if state.det_info:
-            self._label(img, state.det_info, int(w * 0.42), h - 44, _GRAY, scale=0.5)
+            self._label(img, state.det_info, int(w * 0.42), 8, _GRAY, scale=0.45)
         if state.mem_info:
-            self._label(img, state.mem_info, int(w * 0.42), h - 22, _GRAY, scale=0.5)
+            self._label(img, state.mem_info, int(w * 0.42), 28, _GRAY, scale=0.45)
+
+        if state.input_visible:
+            self._draw_input_bar(img, state)
+        else:
+            # no input bar → put status at bottom as before
+            cv2.rectangle(img, (0, h - 40), (w, h), _BG, -1)
+            self._label(img, state.status_line, 10, h - 30, _WHITE, scale=0.55)
+
         if state.subtitle:
             # subtitle banner (last TTS / ASR text)
-            self._center_banner(img, state.subtitle, h - 96)
+            self._center_banner(img, state.subtitle, 64)
 
         return img
+
+    def _draw_input_bar(self, img: np.ndarray, state: OverlayState) -> None:
+        """In-frame text command box — visible without a microphone."""
+        h, w = img.shape[:2]
+        bar_y = h - 42
+        pad = 10
+        bar_h = 30
+        border = _YELLOW if state.input_focused else (90, 90, 90)
+        thickness = 2 if state.input_focused else 1
+        x1, y1 = pad, bar_y
+        x2, y2 = w - pad, bar_y + bar_h
+        # field bg
+        cv2.rectangle(img, (x1, y1), (x2, y2), (45, 45, 45), -1)
+        cv2.rectangle(img, (x1, y1), (x2, y2), border, thickness)
+
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            import os
+
+            pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil)
+            font_path = None
+            for c in (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf"):
+                if os.path.isfile(c):
+                    font_path = c
+                    break
+            fnt = ImageFont.truetype(font_path, 16) if font_path else ImageFont.load_default()
+            # prefix
+            prefix = "指令> " if state.input_focused else "指令: "
+            draw.text((x1 + 8, y1 + 5), prefix, font=fnt, fill=(120, 220, 255) if state.input_focused else (160, 160, 160))
+            prefix_w = draw.textbbox((0, 0), prefix, font=fnt)[2]
+            body = state.input_text if state.input_text else state.input_placeholder
+            color = (245, 245, 245) if state.input_text else (130, 130, 130)
+            # caret
+            text = body + ("▌" if state.input_focused and int(time.time() * 2) % 2 == 0 else "")
+            draw.text((x1 + 8 + prefix_w, y1 + 5), text, font=fnt, fill=color)
+            img[:] = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+        except Exception:
+            label = f"cmd: {state.input_text or state.input_placeholder}"
+            cv2.putText(img, label, (x1 + 8, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1, cv2.LINE_AA)
 
     def _label(self, img, text, x, y, color, scale=0.55):
         try:
