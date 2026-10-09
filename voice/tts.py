@@ -28,6 +28,11 @@ log = logging.getLogger(__name__)
 
 
 class TtsClient:
+    # The GPT-SoVITS server is a LOCAL process. If the shell has http_proxy set,
+    # urllib would tunnel 127.0.0.1 through it and fail with502 Bad Gateway.
+    # Always bypass proxies for loopback calls.
+    _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.mode = str(cfg.get("mode", "gpt_sovits")).lower()
@@ -164,7 +169,7 @@ class TtsClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with TtsClient._OPENER.open(req, timeout=self.timeout) as resp:
                 data = resp.read()
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise RuntimeError(f"GPT-SoVITS server unreachable at {self.server_url}: {e}") from e
@@ -273,7 +278,7 @@ class TtsClient:
             return "mock"
         try:
             req = urllib.request.Request(f"{self.server_url}/health", method="GET")
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
+            with TtsClient._OPENER.open(req, timeout=1.5) as resp:
                 return f"ok:{resp.status}"
         except Exception:
             return "down"

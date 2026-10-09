@@ -48,13 +48,23 @@ resnet18:
 # Object feature library — NumPy cosine similarity (no FAISS).
 # known  : best score >= match_threshold → name + similarity
 # unknown: best score <  match_threshold → 未知物体
-# Calibrate: python tools/calibrate_threshold.py --compute
+#
+# 0.6769 是【实测标定】值，不是拍脑袋的（2026-10-06）。
+#   数据：data/dataset/ — 6 个录入物体 × 6 张注册图，3 张留出测试图
+#                + 4 个未录入物体（香蕉/碗/雨伞/椅子）
+#   实测：测试集 top-1 命中率 100% (18/18)
+#        正样本余弦 min=0.7177 mean=0.7940
+#        负样本余弦 max=0.6361 mean=0.5646
+#        → 正负分布完全分离，中间 0.0816 空隙，0.6769 取中点使两侧余量相等
+#   标定：python tools/eval_dataset.py --apply
+#   注：碗(0.586→马克杯) / 椅子 / 香蕉 是最难的负样本，说明「形状近似
+#      但类别不同」正是 ResNet18 分类特征的薄弱点。
 # ---------------------------------------------------------------------------
 memory:
   db_path: data/visual_memory.db
   samples_dir: data/samples
   embeddings_path: data/resnet18_embeddings.npz
-  match_threshold: 0.65
+  match_threshold: 0.6769
   topk: 3
   min_samples: 3
   max_samples: 10
@@ -83,18 +93,27 @@ asr:
   device: cpu
 
 # ---------------------------------------------------------------------------
-# TTS — GPT-SoVITS as INDEPENDENT module. Vision never waits on TTS.
+# TTS — GPT-SoVITS as INDEPENDENT module/process. Vision never waits on TTS.
 # mode: gpt_sovits | mock   (mock = silent/local test without GPT-SoVITS)
+#
+# 前置：先在**另一个终端**启动 TTS 服务器（不能用 vision_ai 环境，它没有 torchaudio）
+#     tools\start_tts_server.bat
+#     或 python -m voice.tts_server --gpt-sovits-path E:/GPT-SoVITS --port 19880 ^
+#            --device cpu --ref-audio models/gpt_sovits/ref_audio.wav ^
+#            --prompt-text "<与参考音频内容一致的文本>" --preload
+# 实测（2026-10-06，CPU / FP32，s1v3+s2Gv3+中文HuBERT）：
+#     首次（含懒加载）RTF 4.90；热态平均 RTF 1.29→ 交互可接受
+#     引擎常驻约 2GB，但独立进程，视觉侧 30FPS 不受影响
 # ---------------------------------------------------------------------------
 tts:
   enabled: true
   mode: gpt_sovits
   server_url: http://127.0.0.1:19880
   ref_audio: models/gpt_sovits/ref_audio.wav
-  ref_text: "我是你的离线视觉助手。"
-  prompt_text: "我是你的离线视觉助手。"
+  # 必须与 ref_audio 的**实际说话内容**逐字一致，否则音色/韵律会变差
+  prompt_text: "对我做了介绍啊那么我想说的话是呢大家如果对我的研究感兴趣呢你"
   prompt_lang: zh
-  timeout_s: 20
+  timeout_s: 30
   play_audio: true
   mock_wav: data/tts_beep.wav
 

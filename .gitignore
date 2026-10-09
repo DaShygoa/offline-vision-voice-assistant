@@ -26,3 +26,6 @@ benchmark_report.json
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# IDE local workspace
+.workbuddy/
