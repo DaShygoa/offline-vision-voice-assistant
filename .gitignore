@@ -16,7 +16,9 @@ models/**
 # Runtime data / visual memory
 data/**
 !data/.gitkeep
-!data/.gitkeep
+# 例外：场景级测试图要入库（论文/答辩可复现），manifest 含 license 与出处
+!data/test_scenes
+!data/test_scenes/**
 
 # Reports / logs
 benchmark_report.json

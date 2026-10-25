@@ -1,0 +1,314 @@
+{
+  "created": "2026-10-22 15:58:53",
+  "source": "Wikimedia Commons",
+  "purpose": "scene-level end-to-end test (full image, NOT cropped)",
+  "yolo": "OpenVINO:GPU:FP16",
+  "min_conf": 0.25,
+  "scenes": [
+    {
+      "key": "cup",
+      "cn": "马克杯",
+      "cls": "cup",
+      "cls_id": 41,
+      "images": [
+        {
+          "file": "cup_scene_00.jpg",
+          "status": "detected",
+          "yolo_conf": 0.904,
+          "box": [
+            2100,
+            1,
+            3395,
+            950
+          ],
+          "img_size": [
+            4261,
+            2822
+          ],
+          "area_frac": 0.102,
+          "src_title": "File:Laptop and a mug (Unsplash).jpg",
+          "src_page": "https://commons.wikimedia.org/wiki/File%3ALaptop%20and%20a%20mug%20%28Unsplash%29.jpg",
+          "license": "CC0",
+          "author": "Ryan Riggins ryan_riggins"
+        },
+        {
+          "file": "cup_scene_01.jpg",
+          "status": "detected",
+          "yolo_conf": 0.897,
+          "box": [
+            872,
+            2711,
+            2779,
+            5071
+          ],
+          "img_size": [
+            4016,
+            6016
+          ],
+          "area_frac": 0.186,
+          "src_title": "File:A coffee cup featuring intricate latte art sits on a wooden table next to an open laptop.jpg",
+          "src_page": "https://commons.wikimedia.org/wiki/File%3AA%20coffee%20cup%20featuring%20intricate%20latte%20art%20sits%20on%20a%20wooden%20table%20next%20to%20an%20open%20laptop.jpg",
+          "license": "CC BY 2.0",
+          "author": "Shixart1985"
+        },
+        {
+          "file": "cup_scene_02.jpg",
+          "status": "detected",
+          "yolo_conf": 0.965,
+          "box": [
+            833,
+            4273,
+            2040,
+            5634
+          ],
+          "img_size": [
+            4016,
+            6016
+          ],
+          "area_frac": 0.068,
+          "src_title": "File:A cup of coffee on an office table with a woman on the phone laughing in a blurry background. (51537030534).jpg",
+          "src_page": "https://commons.wikimedia.org/wiki/File%3AA%20cup%20of%20coffee%20on%20an%20office%20table%20with%20a%20woman%20on%20the%20phone%20laughing%20in%20a%20blurry%20background.%20%2851537030534%29.jpg",
+          "license": "CC BY 2.0",
+          "author": "Nenad Stojkovic"
+        }
+      ],
+      "n_images": 3,
+      "n_tried": 3
+    },
+    {
+      "key": "keyboard",
+      "cn": "键盘",
+      "cls": "keyboard",
+      "cls_id": 66,
+      "images": [
+        {
+          "file": "keyboard_scene_00.jpg",
+          "status": "detected",
+          "yolo_conf": 0.961,
+          "box": [
+            2801,
+            2355,
+            4537,
+            3282
+          ],
+          "img_size": [
+            5184,
+            3456
+          ],
+          "area_frac": 0.09,
+          "src_title": "File:Desk Setup (Unsplash).jpg",
+          "src_page": "https://commons.wikimedia.org/wiki/File%3ADesk%20Setup%20%28Unsplash%29.jpg",
+          "license": "CC0",
+          "author": "Luke Chesser lukechesser"
+        },
+        {
+          "file": "keyboard_scene_01.jpg",
+          "status": "detected",
+          "yolo_conf": 0.947,
+          "box": [
+            387,
+            385,
+            743,
+            589
+          ],
+          "img_size": [
+            800,
+            600
+          ],
+          "area_frac": 0.151,
+          "src_title": "File:Apple iMac G5 with iSight.jpg",
+          "src_page": "https://commons.wikimedia.org/wiki/File%3AApple%20iMac%20G5%20with%20iSight.jpg",
+          "license": "CC BY 2.0",
+          "author": "Fernando Carmona"
+        },
+        {
+          "file": "keyboard_scene_02.jpg",
+          "status": "detected",
+          "yolo_conf": 0.961,
+          "box": [
+            2801,
+            2355,
+            4537,
+            3282
+          ],
+          "img_size": [
+            5184,
+            3456
+          ],
+          "area_frac": 0.09,
+          "src_title": "File:Desk Setup (Unsplash).jpg",
+          "src_page": "https://commons.wikimedia.org/wiki/File%3ADesk%20Setup%20%28Unsplash%29.jpg",
+          "license": "CC0",
+          "author": "Luke Chesser lukechesser"
+        }
+      ],
+      "n_images": 3,
+      "n_tried": 15
+    },
+    {
+      "key": "bottle",
+      "cn": "保温瓶",
+      "cls": "bottle",
+      "cls_id": 39,
+      "images": [
+        {
+          "file": "bottle_scene_00.jpg",
+          "status": "detected",
+          "yolo_conf": 0.621,
+          "box": [
+            1424,
+            2268,
+            1520,
+            2472
+          ],
+          "img_size": [
+            4928,
+            3264
+          ],
+          "area_frac": 0.001,
+          "src_title": "File:Digital Taipei registration and FunYours Technology booth (48265704406).jpg",
+          "src_page": "https://commons.wikimedia.org/wiki/File%3ADigital%20Taipei%20registration%20and%20FunYours%20Technology%20booth%20%2848265704406%29.jpg",
+          "license": "CC0",
+          "author": "玄史生"
+        }
+      ],
+      "n_images": 1,
+      "n_tried": 26
+    },
+    {
+      "key": "scissors",
+      "cn": "剪刀",
+      "cls": "scissors",
+      "cls_id": 76,
+      "images": [
+        {
+          "file": "scissors_scene_00.jpg",
+          "status": "detected",
+          "yolo_conf": 0.354,
+          "box": [
+            442,
+            776,
+            3547,
+            1933
+          ],
+          "img_size": [
+            4288,
+            2848
+          ],
+          "area_frac": 0.294,
+          "src_title": "File:The Scissors on the Table.jpg",
+          "src_page": "https://commons.wikimedia.org/wiki/File%3AThe%20Scissors%20on%20the%20Table.jpg",
+          "license": "CC BY-SA 3.0",
+          "author": "pauk"
+        }
+      ],
+      "n_images": 1,
+      "n_tried": 20
+    },
+    {
+      "key": "clock",
+      "cn": "闹钟",
+      "cls": "clock",
+      "cls_id": 74,
+      "images": [
+        {
+          "file": "clock_scene_00.jpg",
+          "status": "detected",
+          "yolo_conf": 0.402,
+          "box": [
+            170,
+            61,
+            1982,
+            2218
+          ],
+          "img_size": [
+            2143,
+            2333
+          ],
+          "area_frac": 0.782,
+          "src_title": "File:002 2020 04 21 Uhren fuer den Innenbereich.jpg",
+          "src_page": "https://commons.wikimedia.org/wiki/File%3A002%202020%2004%2021%20Uhren%20fuer%20den%20Innenbereich.jpg",
+          "license": "CC BY-SA 4.0",
+          "author": "Friedrich Haag"
+        }
+      ],
+      "n_images": 1,
+      "n_tried": 37
+    },
+    {
+      "key": "laptop",
+      "cn": "笔记本电脑",
+      "cls": "laptop",
+      "cls_id": 63,
+      "images": [
+        {
+          "file": "laptop_scene_00.jpg",
+          "status": "detected",
+          "yolo_conf": 0.859,
+          "box": [
+            34,
+            283,
+            955,
+            1064
+          ],
+          "img_size": [
+            960,
+            1280
+          ],
+          "area_frac": 0.585,
+          "src_title": "File:Working on my laptop.jpg",
+          "src_page": "https://commons.wikimedia.org/wiki/File%3AWorking%20on%20my%20laptop.jpg",
+          "license": "CC BY-SA 4.0",
+          "author": "Laurabatanero"
+        }
+      ],
+      "n_images": 1,
+      "n_tried": 40
+    },
+    {
+      "key": "unknown_bowl",
+      "cn": "碗",
+      "cls": "bowl",
+      "cls_id": 45,
+      "images": [],
+      "n_images": 0,
+      "n_tried": 22
+    },
+    {
+      "key": "unknown_banana",
+      "cn": "香蕉",
+      "cls": "banana",
+      "cls_id": 46,
+      "images": [],
+      "n_images": 0,
+      "n_tried": 33
+    },
+    {
+      "key": "unknown_umbrella",
+      "cn": "雨伞",
+      "cls": "umbrella",
+      "cls_id": 25,
+      "images": [],
+      "n_images": 0,
+      "n_tried": 27
+    },
+    {
+      "key": "unknown_chair",
+      "cn": "椅子",
+      "cls": "chair",
+      "cls_id": 56,
+      "images": [],
+      "n_images": 0,
+      "n_tried": 33
+    },
+    {
+      "key": "empty_scene",
+      "cn": "无目标场景",
+      "cls": null,
+      "cls_id": null,
+      "images": [],
+      "n_images": 0,
+      "n_tried": 44
+    }
+  ]
+}
