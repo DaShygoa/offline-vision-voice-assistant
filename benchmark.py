@@ -307,6 +307,15 @@ def bench_tts(cfg: dict) -> Dict[str, object]:
                 "hint": "start: python -m voice.tts_server --gpt-sovits-path <path> --port 19880",
                 "fallback_mode": "mock",
             }
+    elif client.mode == "edge":
+        health = client.health()
+        if health.startswith("down"):
+            return {
+                "ok": False,
+                "error": f"edge-tts unavailable ({health})",
+                "hint": "pip install edge-tts  (needs network access)",
+                "fallback_mode": "mock",
+            }
     # don't start full worker for synth-only bench
     try:
         import sounddevice  # noqa: F401

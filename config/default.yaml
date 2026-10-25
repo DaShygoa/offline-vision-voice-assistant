@@ -107,8 +107,18 @@ asr:
 # ---------------------------------------------------------------------------
 tts:
   enabled: true
-  mode: gpt_sovits
+  # edge     : 微软 Edge TTS。延迟低（实测 ~1.8s 首句含联网）、音色自然，
+  #            需联网，不占本地算力。
+  # gpt_sovits: 本地 GPT-SoVITS 进程。完全离线但 CPU 上 RTF≈1.3，较慢。
+  # mock     : 无声长鸣，仅测试用。
+  mode: edge
   server_url: http://127.0.0.1:19880
+  # ---- Edge TTS 参数（mode=edge 时生效）----
+  # 可选：Yunxi(男,年轻) / Yunjian(男,播音) / Yunyang(男,解说) / Yunxia(男,童声)
+  #       Xiaoxiao(女,自然) / Xiaoyi(女,活泼) / liaoning-Xiaobei / shaanxi-Xiaoni
+  edge_voice: zh-CN-YunxiNeural
+  edge_rate: "+0%"              # 语速，"-10%" 更慢
+  edge_pitch: "+0Hz"
   ref_audio: models/gpt_sovits/ref_audio.wav
   # 必须与 ref_audio 的**实际说话内容**逐字一致，否则音色/韵律会变差
   prompt_text: "对我做了介绍啊那么我想说的话是呢大家如果对我的研究感兴趣呢你"

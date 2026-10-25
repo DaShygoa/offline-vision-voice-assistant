@@ -153,7 +153,8 @@ def main(argv=None) -> int:
     p.add_argument("--yolo-device", choices=["GPU", "CPU"], default=None)
     p.add_argument("--resnet-device", choices=["GPU", "CPU"], default=None)
     p.add_argument("--precision", choices=["FP32", "FP16", "INT8"], default=None)
-    p.add_argument("--tts-mode", choices=["gpt_sovits", "mock"], default=None)
+    p.add_argument("--tts-mode", choices=["edge", "gpt_sovits", "mock"], default=None,
+                   help="TTS 引擎：edge=微软在线(快,需联网) / gpt_sovits=本地离线(慢) / mock=测试")
     p.add_argument(
         "--enroll",
         default=None,

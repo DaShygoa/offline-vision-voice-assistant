@@ -53,7 +53,7 @@
 ├ 检测线程    : 每 N 帧跑一次 YOLO（可选 ROI 助手），更新共享检测结果
 ├ 语音线程    : 麦克风 → VAD → ASR → 意图解析 → 队列
 ├ 意图工作线程: identify / remember / search（ResNet18 + 余弦检索）
-└ TTS 客户端  : GPT-SoVITS 独立进程，异步；UI 不等待
+└ TTS 客户端  : 异步工作线程（edge 在线 / GPT-SoVITS 独立进程）；UI 不等待
 ```
 
 ### 数据流
@@ -80,7 +80,7 @@
 | | `vision/position.py` | 中文方位描述（画面左侧 / 中间 / 右侧） |
 | **语音** | `voice/asr.py` | Paraformer 中文 ASR（CPU INT8），支持 e2e 与 sherpa 两种模型布局 |
 | | `voice/vad.py` | Silero VAD，端点检测；不可用时回退能量 VAD |
-| | `voice/tts.py` | GPT-SoVITS HTTP 客户端，支持 mock 模式 |
+| | `voice/tts.py` | TTS 客户端，支持 edge（默认）/ gpt_sovits / mock 三种引擎 |
 | | `voice/tts_server.py` | 独立 TTS 服务进程（**必须另开终端**） |
 | | `voice/mic.py` | 麦克风流式采集（16 kHz） |
 | **交互** | `nlu/intent.py` | 纯规则中文意图解析（6 类意图） |
@@ -157,7 +157,25 @@ models/sherpa-onnx-paraformer-zh-int8/                ← ASR
 models/silero_vad/silero_vad.onnx                      ← VAD
 ```
 
-### 3. 准备语音合成（可选，独立环境）
+### 3. 准备语音合成
+
+**默认用Edge TTS**（`pip install -r requirements.txt` 已含`edge-tts`），开箱即用、无需额外服务：
+
+```bash
+python main.py --camera 0
+```
+
+可选用 `config/default.yaml` 里的 `tts.edge_voice` 换音色：
+
+| 音色 | 性别 | 特点 |
+|---|---|---|
+| `zh-CN-YunxiNeural` | 男 | 年轻、自然，最贴合语音助手（默认） |
+| `zh-CN-YunjianNeural` | 男 | 播音腔，正式 |
+| `zh-CN-YunyangNeural` | 男 | 解说/新闻腔 |
+| `zh-CN-XiaoxiaoNeural` | 女 | 通用自然 |
+| `zh-CN-XiaoyiNeural` | 女 | 年轻活泼 |
+
+Edge TTS **需要联网**。若现场无网络或要求完全离线，改用本地 GPT-SoVITS：
 
 GPT-SoVITS **不能**装在 `vision_ai` 环境（缺 `torchaudio`），请用另一个环境，
 然后在**另一个终端**启动服务：
@@ -170,8 +188,11 @@ python -m voice.tts_server --gpt-sovits-path E:/GPT-SoVITS --port 19880 ^
        --prompt-text "<与参考音频内容逐字一致的文本>" --preload
 ```
 
-调试时可用 `--mock` 起一个假音频服务，先跑通链路再接真模型。
-不启动 TTS 也不影响视觉功能，视觉侧会提示 TTS 不可用并跳过播报。
+再以 `--tts-mode gpt_sovits` 启动主程序。调试时可用 `--tts-mode mock` 起一个假音频服务。
+TTS 不可用也不影响视觉功能，视觉侧会提示并跳过播报。
+
+> 自训练音色请只用你本人或明确授权的语料。克隆可识别的真实人物声音涉及肖像/声音权益，
+> 且会带来被冒用生成虚假内容的风险。
 
 ### 4. 运行
 
@@ -257,7 +278,7 @@ result: 未知物体  best_candidate=马克杯  similarity=59.3%  threshold=68% 
 | `--yolo-device GPU\|CPU` | 覆盖 YOLO 推理设备 |
 | `--resnet-device GPU\|CPU` | 覆盖 ResNet18 推理设备 |
 | `--precision FP32\|FP16\|INT8` | 覆盖推理精度 |
-| `--tts-mode gpt_sovits\|mock` | 覆盖 TTS 模式 |
+| `--tts-mode edge\|gpt_sovits\|mock` | 覆盖 TTS 模式（edge=微软在线，默认 / gpt_sovits=本地离线 / mock=测试） |
 | `--enroll NAME --images DIR` | 批量录入 |
 | `--recognize IMAGE` | 批量识别 |
 | `-v / --verbose` | 调试日志 |
@@ -323,15 +344,19 @@ python benchmark.py --runs 50 --out benchmark_report.json
 测量项：ResNet18 推理延迟（avg / p50 / p95）、YOLO 延迟、ASR 延迟、TTS RTF、
 进程与系统内存、CPU 占用、iGPU 设备与利用率（best-effort，需 pywin32）。
 
-已记录数据（CPU / FP32，GPT-SoVITS 中文 HuBERT）：
+已记录数据（CPU / FP32）：
 
 | 指标 | 数值 |
 | --- | --- |
-| 首次 TTS 合成 RTF（含懒加载） | 4.90 |
-| 热态平均 TTS RTF | 1.29（交互可接受） |
-| TTS 引擎常驻内存 | ≈ 2 GB（独立进程，视觉侧 30 FPS 不受影响） |
+| **Edge-TTS**（默认）平均延迟 | p50 1.79s（含联网），RTF 0.35–0.65 |
+| 首次 TTS 合成 RTF（含懒加载，GPT-SoVITS） | 4.90 |
+| 热态平均 TTS RTF（GPT-SoVITS） | 1.29（交互可接受） |
+| TTS 引擎常驻内存（GPT-SoVITS） | ≈ 2 GB（独立进程，视觉侧 30 FPS 不受影响） |
 | UI 帧率 | 约 29.7 FPS（1280×720） |
 | YOLO 检测频率 | 每 4 帧一次 @ 30 FPS（约 7.5 FPS，满足 ≥5 FPS 要求） |
+
+> Edge-TTS 延迟含网络往返，断网或网络慢时会变长；对延迟敏感或现场无网络
+> 请切 `--tts-mode gpt_sovits`（本地离线，需另开终端启动服务）。
 
 ---
 
@@ -341,6 +366,8 @@ python benchmark.py --runs 50 --out benchmark_report.json
 | --- | --- |
 | `prepare_models.py` | 一次性下载 / 转换模型（ResNet18、YOLOv8n、Paraformer、VAD） |
 | `fetch_dataset.py` | 从 Wikimedia Commons 构建课程数据集；抓取时即用 YOLO 校验并裁剪 ROI，与在线链路一致 |
+| `fetch_test_scenes.py` | 抓**完整场景测试图**（物体只占画面一角，含杂乱背景），用于端到端验证；与 `fetch_dataset` 的裁剪图互补 |
+| `run_feature_tests.py` | 场景图端到端功能测试：逐图断言「检测 / 裁剪 / 识别 / 未知判断 / 位置播报」5 项，另测未录入类拒绝 |
 | `eval_dataset.py` | 离线评测 + 阈值标定，扫描阈值求 balanced accuracy 最优点 |
 | `calibrate_threshold.py` | 从真实相似度数据标定阈值（正样本 / 负样本 / 光照变体） |
 | `benchmark.py`（根目录） | 性能基准测试 |

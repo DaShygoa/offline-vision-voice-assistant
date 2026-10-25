@@ -13,6 +13,7 @@ kaldi-native-fbank>=1.10.40  # Paraformer e2e feature pipeline (LFR+CMVN)
 sounddevice>=0.4.6
 soundfile>=0.12.1
 librosa>=0.10.0              # optional: only for tooling/tests
+edge-tts>=7.0                # default TTS engine (config tts.mode=edge). Needs network.
 
 # System / benchmark
 psutil>=5.9
@@ -24,3 +25,9 @@ pywin32>=306; sys_platform == "win32"
 
 # NOTE: PyTorch is NOT required at runtime.
 # GPT-SoVITS runs as an independent module (see voice/tts_server.py).
+#
+# TTS engines (config: tts.mode)
+#   edge      -> edge-tts only. Low latency (~1.8s incl. network), needs internet.
+#   gpt_sovits-> fully offline, but CPU RTF ~1.3 (slower). Separate process + torch env.
+#   mock      -> no audio, for tests.
+# Any audio played on this machine must be the user's own or a properly licensed voice.

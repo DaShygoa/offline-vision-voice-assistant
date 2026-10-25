@@ -7,7 +7,11 @@ Design rule (spec §7 / deployment §7):
 
 Modes:
   gpt_sovits : HTTP POST to local GPT-SoVITS-style server (voice/tts_server.py)
+  edge       : Microsoft Edge TTS (needs network; far lower latency than local CPU synth)
   mock       : offline beep / silent (for tests without GPT-SoVITS installed)
+
+All modes go through the same TTS worker thread, so the vision hot path is
+unaffected regardless of which backend is active.
 """
 
 from __future__ import annotations
@@ -136,6 +140,8 @@ class TtsClient:
         try:
             if self.mode == "mock":
                 path = self._mock_synth(text)
+            elif self.mode == "edge":
+                path = self._edge_synth(text)
             else:
                 path = self._gpt_sovits_synth(text)
             dt = (time.perf_counter() - t0) * 1000.0
@@ -150,6 +156,70 @@ class TtsClient:
             self.stats["fail"] += 1
             log.warning("synth error: %s", e)
             return None
+
+    # Available zh-CN voices (edge-tts 7.x, verified by list_voices() on this machine)
+    EDGE_VOICES = (
+        "zh-CN-YunxiNeural",# 男声，年轻，最贴合"语音助手"调性
+        "zh-CN-YunjianNeural",    # 男声，播音腔，正式
+        "zh-CN-YunyangNeural",    # 男声，解说/新闻腔
+        "zh-CN-YunxiaNeural",     # 男声，童声偏成熟
+        "zh-CN-XiaoxiaoNeural",   # 女声，通用自然
+        "zh-CN-XiaoyiNeural",     # 女声，年轻活泼
+        "zh-CN-liaoning-XiaobeiNeural",   # 女声，东北口音
+        "zh-CN-shaanxi-XiaoniNeural",     # 女声，陕西口音
+    )
+
+    def _edge_synth(self, text: str) -> Optional[str]:
+        """Microsoft Edge TTS. Needs network; returns a WAV path.
+
+        edge-tts streams MP3. soundfile/libsndfile>=0.12 handles MP3,
+        but we decode to float32 here so downstream _play() is uniform.
+        """
+        import asyncio
+        import tempfile as _tf
+
+        voice = str(self.cfg.get("edge_voice", "zh-CN-YunxiNeural"))
+        if voice not in self.EDGE_VOICES:
+            log.warning("unknown edge_voice=%s, falling back to Yunxi", voice)
+            voice = "zh-CN-YunxiNeural"
+        rate = str(self.cfg.get("edge_rate", "+0%"))
+        pitch = str(self.cfg.get("edge_pitch", "+0Hz"))
+
+        mp3 = os.path.join(_tf.gettempdir(),
+                           f"tts_edge_{int(time.time()*1000)}.mp3")
+        wav = mp3[:-4] + ".wav"
+
+        async def _run() -> None:
+            import edge_tts
+
+            comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+            await comm.save(mp3)
+
+        asyncio.run(_run())
+
+        # MP3 -> float32 WAV for a uniform playback path
+        try:
+            import soundfile as sf
+
+            data, sr = sf.read(mp3, dtype="float32", always_2d=False)
+        except Exception as e:
+            raise RuntimeError(f"edge-tts produced unreadable mp3: {e}") from e
+        try:
+            os.remove(mp3)
+        except OSError:
+            pass
+
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        # Edge occasionally returns near-silent output; surface it instead of
+        # silently "succeeding" with an empty wav.
+        if float(np.abs(data).max()) < 1e-4:
+            raise RuntimeError("edge-tts returned silence (check text/voice)")
+
+        with open(wav, "wb") as f:
+            pass
+        self._write_wav(wav, data.astype(np.float32), sr)
+        return wav
 
     def _gpt_sovits_synth(self, text: str) -> Optional[str]:
         """POST {text} to local server; expects WAV bytes or JSON {\"path\": ...}."""
@@ -276,6 +346,14 @@ class TtsClient:
             return "disabled"
         if self.mode == "mock":
             return "mock"
+        if self.mode == "edge":
+            # No local process to probe; report whether the SDK is importable.
+            try:
+                import edge_tts  # noqa: F401
+
+                return "ok:edge"
+            except Exception as e:
+                return f"down:{type(e).__name__}"
         try:
             req = urllib.request.Request(f"{self.server_url}/health", method="GET")
             with TtsClient._OPENER.open(req, timeout=1.5) as resp:
