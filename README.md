@@ -1,481 +1,185 @@
-# 基于 ResNet18 与语音交互的物体识别 Demo
+# 离线物体识别与语音助手
 
-> 计算机视觉课程大作业 · **选题一：物体识别**
-> 用 ImageNet 预训练的 ResNet18 提取图像特征并建库，通过余弦相似度检索完成「录入 → 识别 → 未知判断」，再用中文语音下达指令、播报结果。
+使用摄像头录入身边的物体，通过 ResNet18 特征检索识别已录入的物体，并支持中文语音和文字交互。浏览器界面同时显示摄像头画面、深度热力图和物体库。
 
-整个系统**运行时完全离线**，不使用任何云端 API、不需要 GPU 显卡，面向 Windows + Intel iGPU/CPU 平台优化。
+视觉推理、特征检索和语音识别在本地运行，支持 Windows + CPU。默认语音播报使用 Edge TTS，**需要联网**；如需完全离线，可配置本地 GPT-SoVITS 或关闭语音播报。模型首次准备也需要联网，除非已有模型文件。
 
-![演示：语音提问「这是什么」，识别为马克杯（相似度 83%）](docs/screenshots/demo1.png)
+![演示：识别录入的物体](docs/screenshots/demo1.png)
 
----
+## 功能与原理
 
-## 目录
+- **录入**：通过语音或文字命令为当前物体命名，采集多张图片，提取并保存特征。录入不会重新训练模型。
+- **识别**：Depth Anything V2 根据深度生成候选区域；ResNet18 提取 512 维特征，与物体库进行余弦相似度检索。Web 摄像头识别还会检查最佳结果与其他物体的分数差距。
+- **拒识**：相似度未达到阈值时，Web 界面返回“未知物体”；相似度接近的多个已录入物体也可能返回“不太确定”。
+- **倾斜处理**：匹配不确定时，尝试旋转画面；对有明显长轴的候选区域，还会依据轮廓校正倾斜角度。
+- **物体库管理**：浏览已录入物体、查看样本、重命名或删除。语音与文字还支持识别、录入、查找、列出和帮助等指令。
+- **语音交互**：Silero VAD + Paraformer 中文语音识别；语音合成可选 Edge TTS、本地 GPT-SoVITS 或测试模式。
 
-- [核心特性](#核心特性)
-- [系统架构](#系统架构)
-- [技术栈](#技术栈)
-- [快速开始](#快速开始)
-- [使用说明](#使用说明)
-- [评测与阈值标定](#评测与阈值标定)
-- [性能基准](#性能基准)
-- [工具脚本](#工具脚本)
-- [项目结构](#项目结构)
-- [配置说明](#配置说明)
-- [已知局限](#已知局限)
-
----
-
-## 核心特性
-
-| 能力 | 说明 |
-| --- | --- |
-| **物体录入** | 语音说「记住，这个叫我的蓝色水杯」，或按 `r` 用当前画面录入；多视角采样，落盘持久化 |
-| **特征检索识别** | ResNet18 avgpool 512 维特征 → L2 归一化 → 余弦相似度检索 Top-K |
-| **未知判断** | 最高分低于阈值时输出「未知物体」，阈值由真实数据实测标定，非拍脑袋 |
-| **语音交互** | Silero VAD + Paraformer 中文 ASR（CPU INT8）识别指令，GPT-SoVITS 语音播报结果 |
-| **纯离线** | 一次联网准备模型后，推理全程本地；NLU 为纯规则解析，不调用任何大模型 |
-| **无 PyTorch 依赖** | 视觉侧全部走 OpenVINO / ONNX Runtime，运行时不需要 PyTorch |
-| **无 CUDA 依赖** | 针对 Intel iGPU + CPU 部署，GPU 不可用时自动回退 CPU |
-| **无麦克风也能用** | `--no-voice` 退化为键盘 / 文本指令，UI 内嵌输入框（支持中文 IME） |
-| **批量模式** | 不开摄像头不开 UI，直接对本地图片目录做录入或识别，方便评测 |
-
----
-
-## 系统架构
-
-### 线程模型
-
-`core/app.py` 采用多线程编排，**UI 主线程永不阻塞**在推理或语音上：
-
-```
-┌ 主线程      : OpenCV 摄像头 UI 循环 @ 30 FPS（不等待 TTS/ASR/推理）
-├ 摄像头线程  : 取帧 → latest() 缓冲区
-├ 检测线程    : 每 N 帧跑一次 YOLO（可选 ROI 助手），更新共享检测结果
-├ 语音线程    : 麦克风 → VAD → ASR → 意图解析 → 队列
-├ 意图工作线程: identify / remember / search（ResNet18 + 余弦检索）
-└ TTS 客户端  : 异步工作线程（edge 在线 / GPT-SoVITS 独立进程）；UI 不等待
-```
-
-### 数据流
-
-```
-录入 enroll   : 裁剪 ROI → ResNet18 512-d → 名称+特征写入特征库
-识别 identify : 裁剪 ROI → ResNet18 → 与特征库余弦比对 → 分数 ≥ 阈值 ? 名称 : 未知物体
-语音 voice    : ASR 说出物体名称 / TTS 播报识别结果
-```
-
-> **关键设计**：ResNet18 **只在 identify / remember / search 时运行**，绝不进入摄像头热路径，
-> 因此 30 FPS 的 UI 流畅度不受推理影响。YOLO 同理，默认每 4 帧检测一次（约 7.5 FPS）。
-
-### 模块职责
-
-| 模块 | 文件 | 职责 |
-| --- | --- | --- |
-| **视觉** | `vision/feature_extractor.py` | ResNet18 特征提取（OpenVINO 优先，ONNX Runtime 回退） |
-| | `vision/memory.py` | 特征库：SQLite 元数据 + NumPy 特征矩阵 + 余弦检索 |
-| | `vision/detector.py` | YOLOv8n ROI 助手（OpenVINO / OpenCV DNN） |
-| | `vision/object_cropper.py` | ROI 裁剪，YOLO 不可靠时回退中心区域 |
-| | `vision/camera.py` | 摄像头采集 |
-| | `vision/visualizer.py` | 画面叠加层（FPS、字幕、指令栏） |
-| | `vision/position.py` | 中文方位描述（画面左侧 / 中间 / 右侧） |
-| **语音** | `voice/asr.py` | Paraformer 中文 ASR（CPU INT8），支持 e2e 与 sherpa 两种模型布局 |
-| | `voice/vad.py` | Silero VAD，端点检测；不可用时回退能量 VAD |
-| | `voice/tts.py` | TTS 客户端，支持 edge（默认）/ gpt_sovits / mock 三种引擎 |
-| | `voice/tts_server.py` | 独立 TTS 服务进程（**必须另开终端**） |
-| | `voice/mic.py` | 麦克风流式采集（16 kHz） |
-| **交互** | `nlu/intent.py` | 纯规则中文意图解析（6 类意图） |
-| | `ui/text_input.py` | Tk 文本输入窗口（无麦克风方案） |
-| **编排** | `core/app.py` | 多线程主应用 |
-| | `core/config.py` | YAML 配置加载 + CLI 覆盖 + 路径解析 |
-
----
-
-## 技术栈
-
-| 环节 | 方案 | 说明 |
-| --- | --- | --- |
-| 特征提取 | **ResNet18**（ImageNet 预训练） | 选题一指定模型；取 avgpool 512 维输出 |
-| 推理引擎 | **OpenVINO** 2024.4+ | 主后端，Intel iGPU / CPU，FP16 |
-| 回退后端 | ONNX Runtime / OpenCV DNN | GPU 不可用或 IR 缺失时自动降级 |
-| 目标检测 | **YOLOv8n** | 仅用于提出裁剪框，**身份判定始终来自 ResNet18 检索** |
-| 相似度检索 | NumPy 余弦相似度 | 课程规模（几十个物体）无需 FAISS |
-| 语音识别 | **Paraformer** 中文（sherpa-onnx, INT8） | 特征管线：kaldi fbank 80-d + LFR7 + CMVN |
-| 语音端点 | **Silero VAD** | CPU 离线 |
-| 语音合成 | **GPT-SoVITS v3** | 独立进程，经 HTTP 调用 |
-| 意图理解 | 纯正则规则 | 无 LLM、无网络 |
-| 界面 | OpenCV 窗口 + Tk 输入框 | 作业不要求复杂界面 |
-| 语言 | Python 3.10 / 3.11 | — |
-
-### 依赖
-
-```txt
-opencv-python>=4.8          numpy>=1.24,<3
-openvino>=2024.4.0          onnxruntime>=1.18.0
-
-sherpa-onnx>=1.10.50        kaldi-native-fbank>=1.10.40
-sounddevice>=0.4.6          soundfile>=0.12.1
-
-psutil>=5.9                 pyyaml>=6.0                tqdm>=4.66
-pywin32>=306  (win32, 用于统计 iGPU 利用率)
-```
-
-> **运行时不需要 PyTorch。** GPT-SoVITS 作为独立模块单独安装（见下文）。
-
----
+ResNet18 使用 ImageNet 预训练权重。相似度是特征空间中的匹配分数，**不是识别正确的概率**；它会受到录入样本、视角、裁剪、光照和物体库内容影响。深度模型负责定位，物体名称来自特征库检索。
 
 ## 快速开始
 
-### 1. 环境准备
+以下命令在项目根目录的 PowerShell 中运行。建议使用 Python 3.10 或 3.11：
 
-建议使用 conda 虚拟环境（Windows）：
-
-```bash
-conda create -n vision_ai python=3.11 -y
-conda activate vision_ai
-pip install -r requirements.txt
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install flask
 ```
 
-> ⚠️ `run.bat` / `run.ps1` 默认调用 `C:\Users\admin\anaconda3\envs\vision_ai\python.exe`，
-> 请按自己的实际路径修改，或直接用 `python main.py`。
+`requirements.txt` 当前未列出 Web 界面使用的 Flask，因此需要额外安装。运行视觉模型使用 ONNX Runtime CPU，不需要 CUDA、OpenVINO 或 PyTorch。
 
-### 2. 一次性准备模型（需要联网）
+### 准备模型
 
-```bash
-python tools/prepare_models.py --all        # ResNet18 + YOLOv8n + Paraformer + VAD
-# 或分步
+如果模型文件尚未准备，按需运行：
+
+```powershell
+# 导出 ResNet18 ONNX；此步骤需要安装 torch、torchvision 和 onnx
 python tools/prepare_models.py --resnet18
-python tools/prepare_models.py --yolo
-python tools/prepare_models.py --asr
+
+# 下载深度模型和中文语音识别 / VAD 模型
+python tools/prepare_models.py --depth --asr
 ```
 
-产物落在 `models/`（已被 `.gitignore` 排除，不入库）：
-
-```
-models/resnet18/resnet18_openvino_model/resnet18.xml   ← 核心特征模型
-models/yolov8n/yolov8n_openvino_model/yolov8n.xml      ← ROI 助手
-models/sherpa-onnx-paraformer-zh-int8/                ← ASR
-models/silero_vad/silero_vad.onnx                      ← VAD
-```
-
-### 3. 准备语音合成
-
-**默认用Edge TTS**（`pip install -r requirements.txt` 已含`edge-tts`），开箱即用、无需额外服务：
-
-```bash
-python main.py --camera 0
-```
-
-可选用 `config/default.yaml` 里的 `tts.edge_voice` 换音色：
-
-| 音色 | 性别 | 特点 |
-|---|---|---|
-| `zh-CN-YunxiNeural` | 男 | 年轻、自然，最贴合语音助手（默认） |
-| `zh-CN-YunjianNeural` | 男 | 播音腔，正式 |
-| `zh-CN-YunyangNeural` | 男 | 解说/新闻腔 |
-| `zh-CN-XiaoxiaoNeural` | 女 | 通用自然 |
-| `zh-CN-XiaoyiNeural` | 女 | 年轻活泼 |
-
-Edge TTS **需要联网**。若现场无网络或要求完全离线，改用本地 GPT-SoVITS：
-
-GPT-SoVITS **不能**装在 `vision_ai` 环境（缺 `torchaudio`），请用另一个环境，
-然后在**另一个终端**启动服务：
-
-```bash
-tools\start_tts_server.bat
-# 或
-python -m voice.tts_server --gpt-sovits-path E:/GPT-SoVITS --port 19880 ^
-       --device cpu --ref-audio models/gpt_sovits/ref_audio.wav ^
-       --prompt-text "<与参考音频内容逐字一致的文本>" --preload
-```
-
-再以 `--tts-mode gpt_sovits` 启动主程序。调试时可用 `--tts-mode mock` 起一个假音频服务。
-TTS 不可用也不影响视觉功能，视觉侧会提示并跳过播报。
-
-> 自训练音色请只用你本人或明确授权的语料。克隆可识别的真实人物声音涉及肖像/声音权益，
-> 且会带来被冒用生成虚假内容的风险。
-
-### 4. 运行
-
-```bash
-# 完整模式（摄像头 + 语音）
-python main.py --camera 0
-
-# 无麦克风（键盘 / 文本指令）
-python main.py --camera 0 --no-voice
-
-# 无摄像头窗口（CI 冒烟）
-python main.py --headless
-
-# Windows 快捷方式（自动切到 vision_ai 环境）
-run.bat --camera 2 --no-voice
-.\run.ps1 --camera 2 --no-voice
-```
-
-### 5. 冒烟测试（无需摄像头）
-
-```bash
-python tools/smoke_test.py
-```
-
----
-
-## 使用说明
-
-### 语音指令
-
-对麦克风说话即可，支持 6 类意图：
-
-| 意图 | 示例说法 |
-| --- | --- |
-| 识别 | 「这是什么？」「你看这是什么」「认识这个吗」 |
-| 录入 | 「记住，这个叫我的蓝色水杯」「把它叫做马克杯」「记住这个」 |
-| 查找 | 「帮我找我的蓝色水杯」「X 在哪里」 |
-| 遗忘 | 「忘记蓝色水杯」「删掉马克杯」 |
-| 列出 | 「你记住了什么」「列出记忆」 |
-| 帮助 | 「你能做什么」 |
-
-### 键盘快捷键
-
-| 按键 | 功能 |
-| --- | --- |
-| `q` / `Esc` | 退出 |
-| `t` / `/` / `Enter` | 聚焦画面内文本输入框（支持中文 IME） |
-| `i` | 识别当前画面（等价于「这是什么」） |
-| `r` | 录入当前画面为「测试物品」 |
-| `s` | 查找「测试物品」 |
-| `l` | 列出已录入物体 |
-| `o` | 打开本地图片识别 |
-| `h` | 打印快捷键帮助 |
-
-文本框内：`Enter` 发送，`Esc` 取消，`Backspace` 删除，`Tab` 退出焦点。
-
-### 批量模式（不开摄像头、不开 UI）
-
-```bash
-# 录入：物体名称 + 图片目录
-python main.py --enroll 水杯 --images data/enroll/cup
-
-# 识别：单张本地图片
-python main.py --recognize data/query/test.png
-```
-
-输出示例：
+模型准备脚本可能因网络或缺少导出依赖而失败，请检查脚本输出及文件是否存在。ResNet18 导出所需的 PyTorch 只用于准备模型，运行时不需要。主要模型路径由配置文件指定：
 
 ```text
-result: 马克杯  similarity=83.1%  threshold=68%  [known]
-result: 未知物体  best_candidate=马克杯  similarity=59.3%  threshold=68%  [unknown]
+models/resnet18/resnet18.onnx
+models/depth_anything_v2/depth_anything_v2_vits.onnx
+models/sherpa-onnx-paraformer-zh-int8/
+models/silero_vad/silero_vad.onnx
 ```
 
-### 主要命令行参数
+YOLO 和 MobileSAM 是可选组件，可分别使用 `python tools/prepare_models.py --yolo` 和 `--mobilesam` 准备；导出过程可能需要额外依赖。`config/demo.yaml` 默认关闭两者。`--all` 会尝试准备所有组件，而不只是 Web 演示所需的模型。
 
-| 参数 | 说明 |
-| --- | --- |
-| `--config PATH` | 指定 YAML 配置（默认 `config/default.yaml`） |
-| `--camera N` | 摄像头索引 |
-| `--no-voice` | 关闭麦克风 / ASR |
-| `--text-input` | 强制使用文本输入窗口 |
-| `--headless` | 不开 OpenCV 窗口 |
-| `--yolo-device GPU\|CPU` | 覆盖 YOLO 推理设备 |
-| `--resnet-device GPU\|CPU` | 覆盖 ResNet18 推理设备 |
-| `--precision FP32\|FP16\|INT8` | 覆盖推理精度 |
-| `--tts-mode edge\|gpt_sovits\|mock` | 覆盖 TTS 模式（edge=微软在线，默认 / gpt_sovits=本地离线 / mock=测试） |
-| `--enroll NAME --images DIR` | 批量录入 |
-| `--recognize IMAGE` | 批量识别 |
-| `-v / --verbose` | 调试日志 |
+### 启动浏览器界面
 
----
-
-## 评测与阈值标定
-
-### 为什么需要标定
-
-`memory.match_threshold` 直接决定「已知 / 未知」的判定。ImageNet 预训练的 ResNet18
-本质是**分类 backbone** 而非细粒度检索模型，真实余弦分布必须实测，不能拍脑袋。
-
-`tools/eval_dataset.py` 用真实图片跑完整链路，分别统计：
-
-- **正样本**：同一物体、不同视角 → 余弦相似度
-- **负样本**：未录入物体 → 余弦相似度
-- 扫描阈值求 balanced accuracy 最优点，输出正负分布直方图
-
-### 实测结果（2026-10-06）
-
-数据集：6 个录入物体 × 6 张注册图 + 3 张留出测试图 + 4 个未录入物体（香蕉 / 碗 / 雨伞 / 椅子）
-
-| 指标 | 数值 |
-| --- | --- |
-| 测试集 Top-1 命中率 | **100%（18/18）** |
-| 正样本余弦相似度 | min 0.7177 / mean 0.7940 |
-| 负样本余弦相似度 | max 0.6361 / mean 0.5646 |
-| 正负分布间隙 | 0.0816（完全分离） |
-| **采用阈值** | **0.6769**（间隙中点，两侧余量相等） |
-
-复现命令：
-
-```bash
-python tools/eval_dataset.py           # 评测 + 建议阈值
-python tools/eval_dataset.py --apply   # 直接写回 config
+```powershell
+python web/server.py --config config/demo.yaml
 ```
 
-> 正负分布完全分离说明该阈值是**有余量**的，不是贴边硬凑。
-> 最难的负样本是「碗 → 马克杯」（0.586）、椅子、香蕉 —— 印证了
-> 「形状近似但类别不同」正是分类特征的薄弱点。
+打开 [http://127.0.0.1:5000](http://127.0.0.1:5000)。首次启动需要加载模型；按 `Ctrl+C` 停止服务。`config/demo.yaml` 是当前 Web 演示配置，默认摄像头索引为 `0`，可在文件中修改 `app.camera_index`。
 
-### 已知数据要求完成情况
+按需使用以下选项：
 
-选题书要求 vs 实际：
+```powershell
+# 启动时不占用摄像头和麦克风，可稍后在界面中开启
+python web/server.py --config config/demo.yaml --no-camera --no-mic
 
-| 要求 | 完成情况 |
-| --- | --- |
-| ≥5 个物体，每个 ≥5 张图 | ✅ 6 个物体 × 6 张 |
-| 注册图与测试图不完全相同 | ✅ 每物体留出 3 张测试图 |
-| ≥3 个未录入物体测未知判断 | ✅ 4 个（香蕉 / 碗 / 雨伞 / 椅子） |
+# 不启用语音输入
+python web/server.py --config config/demo.yaml --no-voice
 
----
-
-## 性能基准
-
-```bash
-python benchmark.py                          # 完整基准
-python benchmark.py --skip-asr --skip-tts    # 只测视觉
-python benchmark.py --runs 50 --out benchmark_report.json
+# 修改本机监听端口
+python web/server.py --config config/demo.yaml --port 5001
 ```
 
-测量项：ResNet18 推理延迟（avg / p50 / p95）、YOLO 延迟、ASR 延迟、TTS RTF、
-进程与系统内存、CPU 占用、iGPU 设备与利用率（best-effort，需 pywin32）。
+默认只监听本机地址 `127.0.0.1`。摄像头、麦克风或语音模型不可用时，可使用网页下方的文字输入。
 
-已记录数据（CPU / FP32）：
+### 其他入口
 
-| 指标 | 数值 |
-| --- | --- |
-| **Edge-TTS**（默认）平均延迟 | p50 1.79s（含联网），RTF 0.35–0.65 |
-| 首次 TTS 合成 RTF（含懒加载，GPT-SoVITS） | 4.90 |
-| 热态平均 TTS RTF（GPT-SoVITS） | 1.29（交互可接受） |
-| TTS 引擎常驻内存（GPT-SoVITS） | ≈ 2 GB（独立进程，视觉侧 30 FPS 不受影响） |
-| UI 帧率 | 约 29.7 FPS（1280×720） |
-| YOLO 检测频率 | 每 4 帧一次 @ 30 FPS（约 7.5 FPS，满足 ≥5 FPS 要求） |
+```powershell
+# OpenCV 桌面界面
+python main.py --config config/demo.yaml --camera 0
 
-> Edge-TTS 延迟含网络往返，断网或网络慢时会变长；对延迟敏感或现场无网络
-> 请切 `--tts-mode gpt_sovits`（本地离线，需另开终端启动服务）。
+# 不启用语音输入
+python main.py --config config/demo.yaml --camera 0 --no-voice
 
----
-
-## 工具脚本
-
-| 脚本 | 用途 |
-| --- | --- |
-| `prepare_models.py` | 一次性下载 / 转换模型（ResNet18、YOLOv8n、Paraformer、VAD） |
-| `fetch_dataset.py` | 从 Wikimedia Commons 构建课程数据集；抓取时即用 YOLO 校验并裁剪 ROI，与在线链路一致 |
-| `fetch_test_scenes.py` | 抓**完整场景测试图**（物体只占画面一角，含杂乱背景），用于端到端验证；与 `fetch_dataset` 的裁剪图互补 |
-| `run_feature_tests.py` | 场景图端到端功能测试：逐图断言「检测 / 裁剪 / 识别 / 未知判断 / 位置播报」5 项，另测未录入类拒绝 |
-| `eval_dataset.py` | 离线评测 + 阈值标定，扫描阈值求 balanced accuracy 最优点 |
-| `calibrate_threshold.py` | 从真实相似度数据标定阈值（正样本 / 负样本 / 光照变体） |
-| `benchmark.py`（根目录） | 性能基准测试 |
-| `smoke_test.py` | 离线冒烟测试，无需摄像头 / 麦克风 |
-| `export_infer_weights.py` | 把 GPT-SoVITS 训练断点导出为纯推理权重（剥离 optimizer） |
-| `verify_export_pipeline.py` | 端到端验证「训练权重 → 导出 → 引擎加载 → 实际合成」 |
-| `trim_gpt_sovits.py` | 裁剪 GPT-SoVITS 仓库，只保留 v3 推理链路必需文件 |
-| `trace_tts_deps.py` | 用 audit hook 追踪推理真实读取的仓库文件（权威依赖清单） |
-| `probe_tts_deps.py` | 删除法验证依赖：逐个移走候选文件实测引擎能否启动 |
-| `probe_tts_deps_nondestructive.py` | 非破坏性依赖验证（屏蔽模块 / 模拟文件不存在） |
-| `retest_tts_deps.py` | 用长文本 / 数字 / 中英混排复测短句测不出的依赖 |
-| `verify_tts_server_config_isolation.py` | 验证 `--vits-weights` 不会污染 `tts_infer.yaml` |
-| `start_tts_server.bat` | 一键启动独立 TTS 服务 |
-
----
-
-## 项目结构
-
-```
-.
-├── main.py                    # 入口：UI / 批量模式、CLI 参数
-├── benchmark.py               # 性能基准
-├── config/
-│   └── default.yaml           # 唯一配置源，含实测阈值标定注释
-├── core/
-│   ├── app.py                 # 多线程主应用编排
-│   └── config.py              # YAML 加载 + CLI 覆盖 + 路径解析
-├── vision/
-│   ├── feature_extractor.py   # ResNet18 特征提取（OpenVINO / ONNX Runtime）
-│   ├── memory.py              # 特征库：SQLite + NumPy 余弦检索
-│   ├── detector.py            # YOLOv8n ROI 助手
-│   ├── object_cropper.py      # ROI 裁剪 + 中心区域回退
-│   ├── camera.py              # 摄像头采集
-│   ├── visualizer.py          # 画面叠加层
-│   └── position.py            # 中文方位描述
-├── voice/
-│   ├── asr.py                 # Paraformer 中文 ASR
-│   ├── vad.py                 # Silero VAD
-│   ├── tts.py                 # GPT-SoVITS 客户端
-│   ├── tts_server.py          # 独立 TTS 服务（HTTP）
-│   └── mic.py                 # 麦克风采集
-├── nlu/
-│   └── intent.py              # 纯规则中文意图解析
-├── ui/
-│   └── text_input.py          # Tk 文本输入窗口
-├── tools/                     # 见上表
-├── models/                    # 模型（gitignored，需 prepare_models 生成）
-├── data/                      # 特征库、样本、数据集（gitignored）
-└── docs/screenshots/          # 演示截图
+# 批量录入及识别本地图片，不启动摄像头界面
+python main.py --config config/demo.yaml --enroll 水杯 --images data/enroll/cup
+python main.py --config config/demo.yaml --recognize data/query/test.png
 ```
 
-### 数据落盘
+`main.py` 默认使用 `config/default.yaml`；Web 示例显式使用 `config/demo.yaml`。现有 `run.bat` 和 `run.ps1` 含机器相关的 Python 路径，跨机器使用前需检查并修改。
+
+## 使用方法
+
+1. 打开页面，确认摄像头、模型和麦克风状态；也可以使用文字输入。
+2. 将物体完整举到镜头前，尽量避免遮挡，说或输入“记住这个，这是手机”等带名称的命令。采样期间可缓慢调整角度并保持画面清晰。
+3. 在右侧物体库点击缩略图查看录入样本。若物体不完整、被手或背景遮挡，应重新录入。
+4. 举起已录入物体，说或输入“这是什么？”，也可点击页面快捷按钮。
+5. 使用右上角的按钮暂停或恢复识别；右侧物体库可重命名、删除物体。
+
+常见语音或文字命令包括“这是什么？”“记住这个，这是手机”“帮我找手机”“列出已录入列表”和“帮助”。具体命令由 `nlu/intent.py` 的规则解析。
+
+## 相似度与配置
+
+`config/demo.yaml` 中的相关设置：
+
+| 配置 | 当前值 | 作用 |
+| --- | --- | --- |
+| `memory.center_features` | `true` | 在满足条件时减去特征库的共同成分，再计算相似度 |
+| `memory.match_threshold_centered` | `0.5` | 中心化特征的识别阈值，低于它时拒识 |
+| `memory.margin_threshold_centered` | `0.15` | Web 摄像头识别中，第一名与第二名所需的最小分数差 |
+| `memory.match_threshold` | `0.7` | 未启用中心化时使用的阈值 |
+| `memory.min_samples` / `max_samples` | `3` / `10` | 一次录入最少和最多保存的样本数 |
+| `memory.sample_duration_sec` | `2.5` | 正常采样窗口，单位为秒 |
+| `memory.sample_timeout_sec` | `15` | 样本不足时的采样总时限，单位为秒 |
+| `depth.use_mobilesam` | `false` | 是否启用可选的 MobileSAM 细化 |
+
+中心化至少需要两个不同的已录入物体；未满足条件时使用普通特征及对应阈值。新物体加入或删除后，中心化所用的均值可能变化，分数也可能变化。50% 是当前演示中的拒识设置，不是经过所有物体和场景验证的通用阈值：提高阈值可能减少误识别，也会增加把已录入物体判为未知的情况。
+
+网页摄像头识别、桌面识别和本地图片批量识别的裁剪及判断流程并不完全相同；批量命令的未知结果还会在终端显示最相近候选及分数，便于调试。实际使用应分别验证。
+
+## 数据与模型保存
 
 | 路径 | 内容 |
 | --- | --- |
-| `data/visual_memory.db` | SQLite：物体名称、时间戳、样本索引 |
-| `data/resnet18_embeddings.npz` | 压缩特征矩阵 + object_ids，启动时秒级加载 |
-| `data/samples/<name>/*.png` | 录入时保存的样本图 |
-| `data/samples/<name>/*.npy` | 对应的 512 维特征 |
+| `data/visual_memory.db` | SQLite 物体名称、样本索引等元数据 |
+| `data/resnet18_embeddings.npz` | 特征矩阵缓存 |
+| `data/samples/<物体名>/` | 录入样本图片和对应的 `.npy` 特征 |
+| `data/debug/` | 启用调试记录时保存的画面、候选区域和识别报告 |
+| `models/` | 本地模型文件 |
 
-> 特征库与元数据分离保存，重启后可直接继续使用，无需重新录入。
+保留数据库、特征和样本文件，可在重启后继续使用物体库。调试画面可能包含摄像头中的人物与环境，请按需管理；可在配置中设置 `debug.enabled: false` 关闭记录。
 
----
+## 语音播报与离线使用
 
-## 配置说明
+`config/demo.yaml` 默认 `tts.mode: edge`，需要网络。若只需本地视觉识别与语音输入，可在配置中设置 `tts.enabled: false`；`mock` 模式用于测试，不能替代正常语音播报。
 
-所有配置集中在 `config/default.yaml`，`core/config.py` 负责加载、CLI 覆盖与相对路径解析。
+需要离线语音播报时，可在独立环境中安装并启动本地 GPT-SoVITS 服务，再将配置中的 `tts.mode` 设为 `gpt_sovits`，检查 `tts.server_url`、参考音频和对应的 `prompt_text`。服务入口及参数见 `voice/tts_server.py` 和 `tools/start_tts_server.bat`；后者包含本机路径，使用前需要修改。
 
-| 配置块 | 关键项 |
-| --- | --- |
-| `app` | 摄像头索引、分辨率、UI 帧率目标、文本输入开关 |
-| `yolo` | 后端、设备、精度、置信度、NMS、检测间隔帧数 |
-| `resnet18` | 后端、设备、精度、输入尺寸、`embed_dim: 512` |
-| `memory` | **`match_threshold: 0.6769`（实测标定）**、`topk`、`min/max_samples`、`embed_dim` |
-| `asr` | 模型路径、采样率 16 kHz、线程数、静音判定阈值 |
-| `tts` | 模式、服务地址、参考音频、`prompt_text`、超时 |
-| `nlu` | `min_confidence: 0.6` |
+## 验证与排查
 
-### 两个必须注意的配置项
+```powershell
+# 不需要摄像头的自动化检查
+python -m unittest discover -s tools -p 'test_*.py' -q
 
-**1. `tts.prompt_text` 必须与 `ref_audio` 的实际说话内容逐字一致**，否则音色与韵律会明显变差。
+# 原有冒烟测试与可选性能基准
+python tools/smoke_test.py
+python benchmark.py --skip-asr --skip-tts
+```
 
-**2. INT8 精度需要量化后的模型文件**，直接设 `--precision INT8` 而没有对应的量化
-`.xml` 会失败。
+自动化检查包含采样时限、深度候选、纸巾颜色细节、旋转处理和拒识响应等回归场景；它们不能代替真实摄像头下的识别测试。定位失败时，可检查 `data/debug/` 的原图、候选裁剪和报告。`tools/eval_dataset.py` 等工具可用于数据集评测，但历史评测结果及阈值不能直接代表当前中心化配置或新场景的效果。
 
----
+常见问题：
+
+- **页面无法打开**：确认终端没有启动错误，端口未被占用，并访问对应的本机地址。
+- **模型未加载**：检查配置中的模型路径、模型文件和准备脚本输出。
+- **摄像头无画面**：检查设备权限、索引，以及是否被其他程序占用。
+- **录入不足或样本不完整**：将完整物体放在画面中央，保证光线，适当调整角度后重试。
+- **已录入物体显示未知**：查看录入样本及当前裁剪；尝试更接近录入时的角度和光线。倾斜校正不能解决严重遮挡、透视变化或定位不完整。
+- **无法语音播报**：检查 `tts.mode`、网络或本地 TTS 服务；视觉识别可以独立使用。
+
+## 项目结构
+
+```text
+main.py                    桌面界面及本地图片命令行入口
+web/server.py              Flask 浏览器界面服务
+web/templates/index.html   浏览器界面
+config/                    默认及演示配置
+core/                      应用编排与调试记录
+vision/                    深度定位、特征提取、检索和摄像头
+voice/                     语音识别、端点检测、麦克风和语音合成
+nlu/                       中文规则意图解析
+tools/                     模型准备、测试及评测工具
+models/                    本地模型文件
+data/                      物体库、样本和调试数据
+```
 
 ## 已知局限
 
-- **类别粒度受限**：ResNet18 是分类 backbone，对「形状近似但类别不同」的物体
-  （碗 vs 马克杯）区分力有限。细粒度识别需换用度量学习模型（ArcFace / DINOv2 等）。
-- **依赖光照与视角**：录入与识别时的光照、角度差异过大会影响余弦相似度，
-  建议同一物体从多个角度录入。
-- **半双工语音**：为避免识别到自己的播报，识别指令期间会短暂静音麦克风，
-  存在少量重叠语音的边界情况。
-- **单机单进程**：特征库用 SQLite + 内存矩阵，适合几十到几百个物体量级，
-  上万级需要换 FAISS / 向量数据库。
-- **Windows 优先**：部分便捷脚本（`run.bat`、`start_tts_server.bat`）为 Windows 编写。
-
----
-
-## 说明
-
-本项目为课程大作业成果。仓库内使用了大量中文注释，重点解释**为什么这样设计**
-（例如阈值的实测依据、线程模型的取舍、依赖验证方法），便于答辩时说明代码与流程。
-
-**数据与隐私**：仅使用公开数据集（Wikimedia Commons）与自摄图片；
-人脸数据不涉及本项目。如需在自己的数据集上测试，请遵守对应数据的许可协议。
+当前使用分类模型提取的视觉特征，外观相近的物体仍可能被混淆；少量样本也难以覆盖所有视角、光照和遮挡。深度候选有时会包含手或背景，或截掉物体的一部分。相似度阈值和角度校正只能改善部分场景，不能保证零误识别。界面帧率也不等于每次识别的推理速度。
 
 ## License
 

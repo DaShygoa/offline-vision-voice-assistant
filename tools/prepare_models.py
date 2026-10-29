@@ -2,14 +2,17 @@
 """One-time model preparation (requires internet ONCE — runtime stays fully offline).
 
 Downloads / converts:
-  1. ResNet18 (ImageNet pretrained) ONNX → OpenVINO IR  ← 选题一 core feature model
-  2. YOLOv8n ONNX → OpenVINO IR (optional ROI helper)
-  3. sherpa-onnx Paraformer Chinese INT8 + Silero VAD
-  4. Optional note for GPT-SoVITS (installed separately)
+  1. ResNet18 (ImageNet pretrained) → ONNX  ← 选题一 core feature model
+  2. YOLOv8n → ONNX (optional ROI helper)
+  3. Depth Anything V2 Small → ONNX  ← zero-shot object localization
+  4. MobileSAM (TinyViT encoder + mask decoder) → ONNX  ← pixel-precise mask refinement
+  5. sherpa-onnx Paraformer Chinese INT8 + Silero VAD
+  6. Optional note for GPT-SoVITS (installed separately)
 
 Usage:
     python tools/prepare_models.py --all
     python tools/prepare_models.py --resnet18 --asr
+    python tools/prepare_models.py --depth --mobilesam
     python tools/prepare_models.py --yolo-only-local path/to/yolov8n.onnx
 """
 
@@ -73,7 +76,6 @@ def prepare_yolo(local_onnx: str | None = None) -> str:
     yolo_dir = os.path.join(MODELS, "yolov8n")
     os.makedirs(yolo_dir, exist_ok=True)
     onnx_path = os.path.join(yolo_dir, "yolov8n.onnx")
-    ir_xml = os.path.join(yolo_dir, "yolov8n_openvino_model", "yolov8n.xml")
 
     if local_onnx:
         import shutil
@@ -109,42 +111,22 @@ def prepare_yolo(local_onnx: str | None = None) -> str:
                     if os.path.abspath(exported) != os.path.abspath(onnx_path):
                         os.replace(exported, onnx_path)
                     print(f"[ok ] exported → {onnx_path}")
-                    # also export OpenVINO IR (FP16-friendly)
-                    try:
-                        model.export(format="openvino", imgsz=640)
-                        print(f"[ok ] OpenVINO IR → {os.path.dirname(ir_xml)}")
-                    except Exception as e:
-                        print(f"[warn] openvino export: {e}")
             except Exception as e:
                 print(f"[err] {e}")
                 print("      Manual: pip install ultralytics && re-run, or place yolov8n.onnx at:")
                 print(f"      {onnx_path}")
 
-    # ONNX → OpenVINO IR (if not already exported by ultralytics)
-    if os.path.isfile(onnx_path) and not os.path.isfile(ir_xml):
-        try:
-            import openvino as ov
-
-            os.makedirs(os.path.dirname(ir_xml), exist_ok=True)
-            print("[cvrt] ONNX → OpenVINO IR …")
-            ov_model = ov.convert_model(onnx_path)
-            ov.save_model(ov_model, ir_xml, compress_to_fp16=True)
-            print(f"[ok ] {ir_xml}")
-        except Exception as e:
-            print(f"[warn] openvino convert failed: {e}")
-            print("      YOLO can still run via opencv_dnn backend with the ONNX file.")
-    if os.path.isfile(ir_xml):
-        print(f"[done] YOLO IR ready: {ir_xml}")
+    if os.path.isfile(onnx_path):
+        print(f"[done] YOLO ONNX ready: {onnx_path}")
     return onnx_path
 
 
 # ----------------------------------------------------------------- ResNet18
 def prepare_resnet18() -> str:
-    """Export ImageNet-pretrained ResNet18 (avgpool 512-d) → ONNX → OpenVINO IR."""
+    """Export ImageNet-pretrained ResNet18 (avgpool 512-d) → ONNX."""
     rn_dir = os.path.join(MODELS, "resnet18")
     os.makedirs(rn_dir, exist_ok=True)
     onnx_path = os.path.join(rn_dir, "resnet18.onnx")
-    ir_xml = os.path.join(rn_dir, "resnet18_openvino_model", "resnet18.xml")
 
     if not (os.path.isfile(onnx_path) and os.path.getsize(onnx_path) > 10_000_000):
         print("[exp ] export ResNet18 (ImageNet pretrained, fc→Identity) via torchvision …")
@@ -175,21 +157,166 @@ def prepare_resnet18() -> str:
             )
             return ""
 
-    if os.path.isfile(onnx_path) and not os.path.isfile(ir_xml):
-        try:
-            import openvino as ov
-
-            os.makedirs(os.path.dirname(ir_xml), exist_ok=True)
-            print("[cvrt] ResNet18 ONNX → OpenVINO IR …")
-            ov_model = ov.convert_model(onnx_path)
-            ov.save_model(ov_model, ir_xml, compress_to_fp16=True)
-            print(f"[ok ] {ir_xml}")
-        except Exception as e:
-            print(f"[warn] openvino convert failed: {e}")
-            print("      ResNet18 can still run via onnxruntime backend with the ONNX file.")
-    if os.path.isfile(ir_xml):
-        print(f"[done] ResNet18 IR ready: {ir_xml}")
+    if os.path.isfile(onnx_path):
+        print(f"[done] ResNet18 ONNX ready: {onnx_path}")
     return onnx_path
+
+
+# ------------------------------------------------------------------ Depth
+# Depth Anything V2 Small ONNX — zero-shot object localization
+# https://huggingface.co/onnx-community/depth-anything-v2-small
+DEPTH_V2_SMALL_ONNX_URL = (
+    "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx"
+)
+
+
+def prepare_depth() -> str:
+    """Download Depth Anything V2 Small ONNX for zero-shot localization."""
+    depth_dir = os.path.join(MODELS, "depth_anything_v2")
+    os.makedirs(depth_dir, exist_ok=True)
+    onnx_path = os.path.join(depth_dir, "depth_anything_v2_vits.onnx")
+
+    if os.path.isfile(onnx_path) and os.path.getsize(onnx_path) > 50_000_000:
+        print(f"[skip] {onnx_path}")
+        return onnx_path
+
+    try:
+        _download(DEPTH_V2_SMALL_ONNX_URL, onnx_path, "Depth Anything V2 Small ONNX")
+        if os.path.getsize(onnx_path) < 50_000_000:
+            print(f"[warn] file seems too small ({os.path.getsize(onnx_path)} bytes), download may be incomplete")
+        else:
+            print(f"[ok ] Depth Anything V2 Small → {onnx_path}")
+    except Exception as e:
+        print(f"[err] Depth model download failed: {e}")
+        print("      Manual download:")
+        print(f"      {DEPTH_V2_SMALL_ONNX_URL}")
+        print(f"      Save as: {onnx_path}")
+        print("      Alternative: export from HuggingFace transformers:")
+        print("        pip install optimum[onnxruntime]")
+        print("        optimum-cli export onnx --model onnx-community/depth-anything-v2-small --task depth-estimation <out_dir>")
+        return ""
+    return onnx_path
+
+
+# ------------------------------------------------------------- MobileSAM
+# MobileSAM (arXiv 2306.14289) — TinyViT encoder (5M params) + SAM mask decoder
+# Encoder ONNX:  image (1,3,1024,1024) → embedding (1,256,64,64)
+# Decoder ONNX:  embedding + point_coords + point_labels → mask (1,256,256)
+#
+# The checkpoint (mobile_sam.pt) is needed once to export ONNX via torch.
+MOBILESAM_PT_URL = (
+    "https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt"
+)
+
+
+def prepare_mobilesam() -> str:
+    """Export MobileSAM encoder + decoder to ONNX (needs torch once)."""
+    sam_dir = os.path.join(MODELS, "mobile_sam")
+    os.makedirs(sam_dir, exist_ok=True)
+    enc_path = os.path.join(sam_dir, "mobilesam_encoder.onnx")
+    dec_path = os.path.join(sam_dir, "mobilesam_decoder.onnx")
+
+    if os.path.isfile(enc_path) and os.path.isfile(dec_path):
+        print(f"[skip] MobileSAM ONNX already present in {sam_dir}")
+        return sam_dir
+
+    # 1) download checkpoint
+    pt_path = os.path.join(sam_dir, "mobile_sam.pt")
+    if not os.path.isfile(pt_path):
+        try:
+            _download(MOBILESAM_PT_URL, pt_path, "MobileSAM checkpoint (mobile_sam.pt)")
+        except Exception as e:
+            print(f"[err] MobileSAM checkpoint download failed: {e}")
+            print(f"      Manual: {MOBILESAM_PT_URL}")
+            print(f"      Save as: {pt_path}")
+            return ""
+
+    # 2) export encoder + decoder ONNX via MobileSAM's export script (needs torch)
+    print("[exp ] exporting MobileSAM encoder + decoder → ONNX (requires torch) …")
+    try:
+        import sys
+        import subprocess
+        # try the standard MobileSAM export entrypoint if installed
+        result = subprocess.run(
+            [
+                sys.executable, "-c",
+                "from mobile_sam import sam_model_registry; "
+                "import mobile_sam; print('mobile_sam OK')",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            print("[warn] mobile_sam package not installed. Install with:")
+            print("       pip install git+https://github.com/ChaoningZhang/MobileSAM.git")
+            print("       Then re-run: python tools/prepare_models.py --mobilesam")
+            print("       Or export manually (see MobileSAM scripts/export_onnx_model.py):")
+            print(f"         python scripts/export_onnx_model.py --checkpoint {pt_path} \\")
+            print("           --model-type vit_t --output mobilesam_decoder.onnx \\")
+            print("           --image-encoder-output mobilesam_encoder.onnx \\")
+            print("           --fixed-image-size 1024,1024 --return-single-mask")
+            return ""
+
+        # inline export using mobile_sam API
+        import torch
+        from mobile_sam import sam_model_registry
+
+        sam = sam_model_registry["vit_t"](checkpoint=pt_path)
+        sam.eval()
+
+        # --- encoder ONNX ---
+        dummy_img = torch.randn(1, 3, 1024, 1024)
+        torch.onnx.export(
+            sam.image_encoder, dummy_img, enc_path,
+            input_names=["input_image"], output_names=["image_embedding"],
+            opset_version=17, dynamic_axes=None, dynamo=False,
+        )
+        print(f"[ok ] encoder → {enc_path}")
+
+        # --- decoder ONNX (prompt encoder + mask decoder combined) ---
+        dummy_emb = torch.randn(1, 256, 64, 64)
+        dummy_coords = torch.tensor([[[512.0, 512.0]]])
+        dummy_labels = torch.tensor([[1.0]])
+        dummy_size = torch.tensor([[1080, 1920]], dtype=torch.int32)
+
+        class DecoderWrapper(torch.nn.Module):
+            def __init__(self, sam_model):
+                super().__init__()
+                self.prompt_encoder = sam_model.prompt_encoder
+                self.mask_decoder = sam_model.mask_decoder
+
+            def forward(self, image_embedding, point_coords, point_labels, orig_im_size):
+                sparse, dense = self.prompt_encoder(
+                    points=(point_coords, point_labels),
+                    boxes=None, masks=None,
+                )
+                masks, iou_pred, _ = self.mask_decoder(
+                    image_embedding=image_embedding,
+                    image_pe=self.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse,
+                    dense_prompt_embeddings=dense,
+                    multimask_output=False,
+                )
+                return masks, iou_pred
+
+        wrapper = DecoderWrapper(sam)
+        torch.onnx.export(
+            wrapper,
+            (dummy_emb, dummy_coords, dummy_labels, dummy_size),
+            dec_path,
+            input_names=["image_embedding", "point_coords", "point_labels", "orig_im_size"],
+            output_names=["masks", "scores"],
+            opset_version=17,
+            dynamic_axes={"point_coords": {1: "num_points"}, "point_labels": {1: "num_points"}},
+            dynamo=False,
+        )
+        print(f"[ok ] decoder → {dec_path}")
+    except Exception as e:
+        print(f"[err] MobileSAM export failed: {e}")
+        print("      Install: pip install git+https://github.com/ChaoningZhang/MobileSAM.git")
+        print("      Then re-run: python tools/prepare_models.py --mobilesam")
+        return ""
+
+    return sam_dir
 
 
 # ---------------------------------------------------------------------- ASR
@@ -292,11 +419,13 @@ def main(argv=None) -> int:
     p.add_argument("--all", action="store_true")
     p.add_argument("--resnet18", action="store_true", help="export ImageNet ResNet18 (选题一)")
     p.add_argument("--yolo", action="store_true", help="optional YOLOv8n ROI helper")
+    p.add_argument("--depth", action="store_true", help="Depth Anything V2 Small for zero-shot localization")
+    p.add_argument("--mobilesam", action="store_true", help="MobileSAM encoder+decoder ONNX for mask refinement")
     p.add_argument("--asr", action="store_true")
     p.add_argument("--yolo-only-local", default=None, help="use a local yolov8n.onnx path")
     args = p.parse_args(argv)
 
-    if not any([args.all, args.resnet18, args.yolo, args.asr, args.yolo_only_local]):
+    if not any([args.all, args.resnet18, args.yolo, args.depth, args.mobilesam, args.asr, args.yolo_only_local]):
         p.print_help()
         print("\nNOTE: GPT-SoVITS is installed separately — see voice/tts_server.py")
         return 0
@@ -305,6 +434,10 @@ def main(argv=None) -> int:
         prepare_resnet18()
     if args.all or args.yolo or args.yolo_only_local:
         prepare_yolo(args.yolo_only_local)
+    if args.all or args.depth:
+        prepare_depth()
+    if args.all or args.mobilesam:
+        prepare_mobilesam()
     if args.all or args.asr:
         prepare_asr()
     print("\nAll requested model prep done. Runtime = fully offline.")

@@ -23,6 +23,8 @@ import logging
 import os
 import sys
 
+from vision.image_io import imread_unicode, imwrite_unicode
+
 
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -74,7 +76,7 @@ def _run_batch_enroll(cfg: dict, name: str, images_dir: str) -> int:
         for src in paths:
             import cv2
 
-            img = cv2.imread(src)
+            img = imread_unicode(src)
             if img is None:
                 print(f"[skip] unreadable: {src}")
                 continue
@@ -83,7 +85,7 @@ def _run_batch_enroll(cfg: dict, name: str, images_dir: str) -> int:
                 print(f"[skip] embed failed: {src}")
                 continue
             dest = os.path.join(obj_dir, f"s{len(embeds):02d}.png")
-            cv2.imwrite(dest, img)
+            imwrite_unicode(dest, img)
             embeds.append(emb)
             saved.append(dest)
         if len(embeds) < min_samples:
@@ -110,7 +112,7 @@ def _run_batch_recognize(cfg: dict, image_path: str) -> int:
         return 2
     import cv2
 
-    img = cv2.imread(image_path)
+    img = imread_unicode(image_path)
     if img is None:
         print(f"[err] unreadable image: {image_path}", file=sys.stderr)
         return 2
@@ -143,7 +145,7 @@ def _run_batch_recognize(cfg: dict, image_path: str) -> int:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
-        description="ResNet18 + 语音交互物体识别 Demo (选题一, Intel OpenVINO, no CUDA)"
+        description="ResNet18 + 语音交互物体识别 Demo (选题一, CPU only, no CUDA/OpenVINO)"
     )
     p.add_argument("--config", default=None, help="path to YAML config")
     p.add_argument("--camera", type=int, default=None, help="camera index")
@@ -179,7 +181,7 @@ def main(argv=None) -> int:
 
     _setup_logging(args.verbose)
 
-    # wrong env → confusing "No module named openvino/onnxruntime"
+    # wrong env → confusing "No module named onnxruntime"
     missing = []
     for mod in ("cv2", "yaml"):
         try:
@@ -187,9 +189,9 @@ def main(argv=None) -> int:
         except ImportError:
             missing.append(mod)
     try:
-        __import__("openvino")
+        __import__("onnxruntime")
     except ImportError:
-        missing.append("openvino")
+        missing.append("onnxruntime")
     if missing:
         py = sys.executable
         if "vision_ai" not in py.replace("\\", "/"):

@@ -11,7 +11,7 @@ import numpy as np
 
 
 class Camera:
-    def __init__(self, index: int = 0, width: int = 1280, height: int = 720, fps: int = 30):
+    def __init__(self, index: int = 0, width: int = 1920, height: int = 1080, fps: int = 30):
         self.index = index
         self.width = width
         self.height = height

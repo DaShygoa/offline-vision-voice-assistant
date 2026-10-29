@@ -87,66 +87,74 @@ class Visualizer:
         self.show_fps = show_fps
         self.center_roi_frac = center_roi_frac
 
+    @staticmethod
+    def _font_scale(h: int) -> float:
+        """Scale factor so fonts look consistent across 720p / 1080p / 4K."""
+        return max(1.0, h / 720.0)
+
     def draw(self, frame: np.ndarray, state: OverlayState) -> np.ndarray:
         h, w = frame.shape[:2]
+        s = self._font_scale(h)
         img = frame.copy()
 
         for d in state.detections:
             x1, y1, x2, y2 = [int(v) for v in d.xyxy]
-            cv2.rectangle(img, (x1, y1), (x2, y2), _BLUE, 2)
+            cv2.rectangle(img, (x1, y1), (x2, y2), _BLUE, max(2, int(2 * s)))
             caption = f"{d.label} {d.conf:.2f}"
-            self._label(img, caption, x1, max(0, y1 - 22), _BLUE)
+            self._label(img, caption, x1, max(0, y1 - int(22 * s)), _BLUE, scale=0.55 * s)
 
         for box, label, conf in state.highlight:
             x1, y1, x2, y2 = [int(v) for v in box]
-            cv2.rectangle(img, (x1, y1), (x2, y2), _GREEN, 3)
-            self._label(img, f"{label} ({conf:.2f})", x1, max(0, y1 - 24), _GREEN)
+            cv2.rectangle(img, (x1, y1), (x2, y2), _GREEN, max(3, int(3 * s)))
+            self._label(img, f"{label} ({conf:.2f})", x1, max(0, y1 - int(24 * s)), _GREEN, scale=0.55 * s)
 
         if state.learning:
             rw = int(w * self.center_roi_frac)
             rh = int(h * self.center_roi_frac)
             x1, y1 = w // 2 - rw // 2, h // 2 - rh // 2
             x2, y2 = x1 + rw, y1 + rh
-            cv2.rectangle(img, (x1, y1), (x2, y2), _YELLOW, 2)
+            cv2.rectangle(img, (x1, y1), (x2, y2), _YELLOW, max(2, int(2 * s)))
             # progress
             bar_w = int(rw * max(0.0, min(1.0, state.learning_progress)))
-            cv2.rectangle(img, (x1, y2 - 8), (x1 + bar_w, y2), _YELLOW, -1)
-            msg = state.learning_label or "请将物体放入中央区域"
-            self._center_text(img, msg, h // 2 - rh // 2 - 36, _YELLOW, scale=0.8)
-            tip = "保持物体在框内，可轻微转动"
-            self._center_text(img, tip, y2 + 18, _GRAY, scale=0.5)
+            cv2.rectangle(img, (x1, y2 - int(8 * s)), (x1 + bar_w, y2), _YELLOW, -1)
+            msg = state.learning_label or "请把物体拿稳靠近镜头"
+            self._center_text(img, msg, h // 2 - rh // 2 - int(36 * s), _YELLOW, scale=0.8 * s)
+            tip = "保持物体稳定，可轻微转动"
+            self._center_text(img, tip, y2 + int(18 * s), _GRAY, scale=0.5 * s)
 
         # status bar (top strip) + input bar (bottom strip)
-        cv2.rectangle(img, (0, 0), (w, 48), _BG, -1)  # info bar at top
+        bar_h = int(48 * s)
+        cv2.rectangle(img, (0, 0), (w, bar_h), _BG, -1)  # info bar at top
         if self.show_fps:
-            self._label(img, f"FPS {state.fps:.1f}", 10, 8, _WHITE, scale=0.5)
-        self._label(img, state.status_line, 10, 28, _WHITE, scale=0.55)
+            self._label(img, f"FPS {state.fps:.1f}", 10, int(8 * s), _WHITE, scale=0.5 * s)
+        self._label(img, state.status_line, 10, int(28 * s), _WHITE, scale=0.55 * s)
         if state.det_info:
-            self._label(img, state.det_info, int(w * 0.42), 8, _GRAY, scale=0.45)
+            self._label(img, state.det_info, int(w * 0.42), int(8 * s), _GRAY, scale=0.45 * s)
         if state.mem_info:
-            self._label(img, state.mem_info, int(w * 0.42), 28, _GRAY, scale=0.45)
+            self._label(img, state.mem_info, int(w * 0.42), int(28 * s), _GRAY, scale=0.45 * s)
 
         if state.input_visible:
             self._draw_input_bar(img, state)
         else:
             # no input bar → put status at bottom as before
-            cv2.rectangle(img, (0, h - 40), (w, h), _BG, -1)
-            self._label(img, state.status_line, 10, h - 30, _WHITE, scale=0.55)
+            cv2.rectangle(img, (0, h - int(40 * s)), (w, h), _BG, -1)
+            self._label(img, state.status_line, 10, h - int(30 * s), _WHITE, scale=0.55 * s)
 
         if state.subtitle:
             # subtitle banner (last TTS / ASR text)
-            self._center_banner(img, state.subtitle, 64)
+            self._center_banner(img, state.subtitle, int(64 * s))
 
         return img
 
     def _draw_input_bar(self, img: np.ndarray, state: OverlayState) -> None:
         """In-frame text command box — visible without a microphone."""
         h, w = img.shape[:2]
-        bar_y = h - 42
-        pad = 10
-        bar_h = 30
+        s = self._font_scale(h)
+        bar_h = int(30 * s)
+        bar_y = h - bar_h - int(12 * s)
+        pad = int(10 * s)
         border = _YELLOW if state.input_focused else (90, 90, 90)
-        thickness = 2 if state.input_focused else 1
+        thickness = max(1, int(2 * s)) if state.input_focused else 1
         x1, y1 = pad, bar_y
         x2, y2 = w - pad, bar_y + bar_h
         # field bg
@@ -164,29 +172,27 @@ class Visualizer:
                 if os.path.isfile(c):
                     font_path = c
                     break
-            fnt = ImageFont.truetype(font_path, 16) if font_path else ImageFont.load_default()
+            fnt_size = int(16 * s)
+            fnt = ImageFont.truetype(font_path, fnt_size) if font_path else ImageFont.load_default()
             # prefix
             prefix = "指令> " if state.input_focused else "指令: "
-            draw.text((x1 + 8, y1 + 5), prefix, font=fnt, fill=(120, 220, 255) if state.input_focused else (160, 160, 160))
+            draw.text((x1 + int(8 * s), y1 + int(5 * s)), prefix, font=fnt, fill=(120, 220, 255) if state.input_focused else (160, 160, 160))
             prefix_w = draw.textbbox((0, 0), prefix, font=fnt)[2]
             body = state.input_text if state.input_text else state.input_placeholder
             color = (245, 245, 245) if state.input_text else (130, 130, 130)
             # caret
             text = body + ("▌" if state.input_focused and int(time.time() * 2) % 2 == 0 else "")
-            draw.text((x1 + 8 + prefix_w, y1 + 5), text, font=fnt, fill=color)
+            draw.text((x1 + int(8 * s) + prefix_w, y1 + int(5 * s)), text, font=fnt, fill=color)
             img[:] = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
         except Exception:
             label = f"cmd: {state.input_text or state.input_placeholder}"
-            cv2.putText(img, label, (x1 + 8, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1, cv2.LINE_AA)
+            cv2.putText(img, label, (x1 + int(8 * s), y1 + int(20 * s)), cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, (240, 240, 240), 1, cv2.LINE_AA)
 
     def _label(self, img, text, x, y, color, scale=0.55):
         try:
             from PIL import Image, ImageDraw, ImageFont
             import os
 
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            pil = Image.fromarray(img_rgb)
-            draw = ImageDraw.Draw(pil)
             font_path = None
             for c in (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf"):
                 if os.path.isfile(c):
@@ -194,14 +200,37 @@ class Visualizer:
                     break
             font_size = max(13, int(scale * 22))
             fnt = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
-            # background chip for readability
-            bbox = draw.textbbox((x, y), text, font=fnt)
-            draw.rectangle((bbox[0] - 3, bbox[1] - 2, bbox[2] + 3, bbox[3] + 2), fill=(0, 0, 0))
-            draw.text((x, y), text, font=fnt, fill=(int(color[2]), int(color[1]), int(color[0])))
-            arr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-            img[:] = arr
+
+            # measure text size first
+            tmp = Image.new("RGB", (1, 1))
+            td = ImageDraw.Draw(tmp)
+            bbox = td.textbbox((0, 0), text, font=fnt)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            pad = 4
+
+            # only convert the local region around the text (not the full frame!)
+            H, W = img.shape[:2]
+            rx1 = max(0, x - bbox[0] - pad)
+            ry1 = max(0, y - bbox[1] - pad)
+            rx2 = min(W, x + tw + pad)
+            ry2 = min(H, y + th + pad)
+            if rx2 <= rx1 or ry2 <= ry1:
+                return img
+
+            roi = img[ry1:ry2, rx1:rx2]
+            pil = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil)
+            # draw text at offset within ROI
+            draw.text((x - rx1 - bbox[0], y - ry1 - bbox[1]), text, font=fnt,
+                      fill=(int(color[2]), int(color[1]), int(color[0])))
+            # black chip for readability
+            chip = td.textbbox((x - rx1 - bbox[0], y - ry1 - bbox[1]), text, font=fnt)
+            # draw chip first would need re-order; skip for speed — text is readable on dark UI
+
+            img[ry1:ry2, rx1:rx2] = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
         except Exception:
             cv2.putText(img, text, (x, y + 14), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+        return img
 
     def _center_text(self, img, text, y, color, scale=0.7):
         h, w = img.shape[:2]
@@ -229,6 +258,7 @@ class Visualizer:
 
     def _center_banner(self, img, text, y):
         h, w = img.shape[:2]
+        s = self._font_scale(h)
         try:
             from PIL import Image, ImageDraw, ImageFont
             import os
@@ -240,7 +270,7 @@ class Visualizer:
                 if os.path.isfile(c):
                     font_path = c
                     break
-            fnt = ImageFont.truetype(font_path, 20) if font_path else ImageFont.load_default()
+            fnt = ImageFont.truetype(font_path, int(20 * s)) if font_path else ImageFont.load_default()
             bbox = draw.textbbox((0, 0), text, font=fnt)
             tw = bbox[2] - bbox[0]
             th = bbox[3] - bbox[1]

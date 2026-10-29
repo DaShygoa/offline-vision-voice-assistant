@@ -54,7 +54,18 @@ class VisualMemory:
         self.db_path = cfg.get("db_path", "data/visual_memory.db")
         self.samples_dir = cfg.get("samples_dir", "data/samples")
         self.embeddings_path = cfg.get("embeddings_path", "data/resnet18_embeddings.npz")
-        self.threshold = float(cfg.get("match_threshold", 0.65))
+        self._threshold = float(cfg.get("match_threshold", 0.65))
+        # Common-component removal. ResNet18 avgpool features are ~87% "common
+        # component" (lighting / texture / background statistics shared by every
+        # photo), so two completely different objects still score ~0.6 cosine.
+        # Subtracting the bank mean before the cosine drops cross-object scores to
+        # ~-0.7 while keeping same-object scores intact.
+        self.center_features = bool(cfg.get("center_features", True))
+        # Scoring scale differs once features are centred (same-object ~0.5-0.9,
+        # cross-object ~-0.7), so the threshold must be re-calibrated.
+        self._threshold_centered = float(cfg.get("match_threshold_centered", 0.30))
+        self._margin_threshold = float(cfg.get("margin_threshold", 0.05))
+        self._margin_threshold_centered = float(cfg.get("margin_threshold_centered", 0.15))
         self.topk = int(cfg.get("topk", 3))
         self.max_samples = int(cfg.get("max_samples", 10))
         self.embed_dim = int(cfg.get("embed_dim", 512))
@@ -70,6 +81,10 @@ class VisualMemory:
 
         # in-memory cosine index: rows = L2-normalized embeddings
         self._matrix: np.ndarray = np.zeros((0, 0), dtype=np.float32)
+        # common-component-removed view of the bank (rebuilt when the bank changes)
+        self._centered_matrix: np.ndarray = np.zeros((0, 0), dtype=np.float32)
+        self._mean_vec: np.ndarray = np.zeros((0,), dtype=np.float32)
+        self._centered_row_ids: List[int] = []
         self._row_object_id: List[int] = []
         self._load_index()
         self._purge_featureless_objects()
@@ -124,6 +139,7 @@ class VisualMemory:
                     if mat.size and mat.shape[1] == self.embed_dim and len(ids) == mat.shape[0]:
                         self._matrix = mat
                         self._row_object_id = ids
+                        self._refresh_centered()
                         return
                     log.info("Stale feature bank (dim mismatch), rebuilding …")
                 except Exception as e:
@@ -163,6 +179,7 @@ class VisualMemory:
             )
             self._row_object_id = ids
             self._save_index()
+            self._refresh_centered()
 
     def _save_index(self) -> None:
         with self._lock:
@@ -172,6 +189,72 @@ class VisualMemory:
                 matrix=mat,
                 object_ids=np.array(self._row_object_id, dtype=np.int64),
             )
+
+    # ------------------------------------------------- effective thresholds
+    @property
+    def centering_active(self) -> bool:
+        """True when matching runs on the common-component-removed bank."""
+        return bool(getattr(self, "_centered_matrix", np.zeros((0, 0))).size)
+
+    @property
+    def threshold(self) -> float:
+        """Score threshold for the space currently in use."""
+        if self.centering_active:
+            return self._threshold_centered
+        return self._threshold
+
+    @property
+    def margin_threshold(self) -> float:
+        """top-1 must beat top-2 by this much to be called 'sure'."""
+        if self.centering_active:
+            return self._margin_threshold_centered
+        return self._margin_threshold
+
+    # ------------------------------------------------- common-component removal
+    def _refresh_centered(self) -> None:
+        """Recompute the centred bank used for matching.
+
+        ResNet18 avgpool features are dominated by a shared "common component"
+        (lighting, texture and background statistics). Measured on this project:
+        87% of the 512-d vector is common to every photo, so two unrelated objects
+        still score ~0.6 cosine. Subtracting the bank mean before the cosine
+        separates them (cross-object drops to ~-0.7, same-object stays ~0.5-0.9).
+
+        Guard: needs at least two distinct objects in the bank. With a single
+        object the mean IS that object's class mean, which collapses intra-class
+        similarity (measured 0.85 -> 0.03) and breaks recognition outright.
+        """
+        with self._lock:
+            self._centered_matrix = np.zeros((0, 0), dtype=np.float32)
+            self._mean_vec = np.zeros((0,), dtype=np.float32)
+            if not self.center_features or self._matrix.size == 0:
+                return
+            distinct = len(set(self._row_object_id))
+            if distinct < 2:
+                return
+            mean = self._matrix.mean(axis=0)
+            # NOTE: _l2() flattens with reshape(-1) — it only works on 1-D
+            # vectors. The bank must be normalised row-wise.
+            centered = self._matrix - mean
+            norms = np.linalg.norm(centered, axis=1, keepdims=True)
+            centered = centered / np.maximum(norms, 1e-12)
+            # Drop degenerate rows (a sample identical to the bank mean)
+            keep = (norms[:, 0] > 1e-6)
+            if not keep.any():
+                return
+            self._mean_vec = mean.astype(np.float32)
+            self._centered_matrix = centered[keep].astype(np.float32)
+            self._centered_row_ids = [oid for oid, k in zip(self._row_object_id, keep) if k]
+            log.info("Centred feature bank: %d objects, %d samples, common component %.1f%%",
+                     distinct, int(keep.sum()),
+                     np.linalg.norm(mean) / max(np.linalg.norm(self._matrix, axis=1).mean(), 1e-8) * 100)
+
+    def _match_space(self, embedding: Optional[np.ndarray]):
+        """Return (matrix, row_ids, query_vector) in the space used for matching."""
+        if self._centered_matrix.size:
+            q = embedding - self._mean_vec
+            return self._centered_matrix, self._centered_row_ids, _l2(q)
+        return self._matrix, self._row_object_id, _l2(embedding)
 
     # ------------------------------------------------------------- remember
     def add_object(
@@ -236,6 +319,7 @@ class VisualMemory:
 
             self._conn.commit()
             self._save_index()
+            self._refresh_centered()
             log.info("Remembered '%s' with %d samples (id=%d)", user_name, len(embeddings), oid)
             return MemoryObject(oid, user_name, generic_class, now, sample_count=len(embeddings))
 
@@ -259,14 +343,14 @@ class VisualMemory:
         with self._lock:
             if embedding is None or self._matrix.size == 0 or not self._row_object_id:
                 return []
-            qq = _l2(embedding)
-            if qq.shape[0] != self._matrix.shape[1]:
-                log.warning("query dim %d != bank dim %d", qq.shape[0], self._matrix.shape[1])
+            mat, row_ids, qq = self._match_space(embedding)
+            if qq.shape[0] != mat.shape[1]:
+                log.warning("query dim %d != bank dim %d", qq.shape[0], mat.shape[1])
                 return []
-            scores = self._matrix @ qq
+            scores = mat @ qq
             best: dict[int, float] = {}
             for i, s in enumerate(scores):
-                oid = int(self._row_object_id[i])
+                oid = int(row_ids[i])
                 fs = float(s)
                 if oid not in best or fs > best[oid]:
                     best[oid] = fs
@@ -288,10 +372,31 @@ class VisualMemory:
                 )
             return out
 
+    def sample_images(self, user_name: str) -> List[str]:
+        """Image paths of the enrolled samples for an object (may be empty on disk)."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT s.image_path FROM object_samples s "
+                "JOIN objects o ON o.id = s.object_id "
+                "WHERE o.user_name = ? ORDER BY s.id",
+                (user_name,),
+            )
+            out = []
+            for r in cur.fetchall():
+                p = r["image_path"]
+                if p and os.path.isfile(p):
+                    out.append(p)
+            return out
+
     def best_match(self, embedding: Optional[np.ndarray] = None) -> Optional[MemoryMatch]:
         """Top-1 match regardless of threshold (caller decides known vs unknown)."""
         m = self.query(embedding, topk=1)
         return m[0] if m else None
+
+    def top_k(self, embedding: Optional[np.ndarray], k: int = 3) -> List[MemoryMatch]:
+        """Top-k matches for debugging / ranking display."""
+        return self.query(embedding, topk=max(1, int(k))) or []
 
     def match_detections(
         self,
@@ -354,6 +459,36 @@ class VisualMemory:
             return None
         return self.get_object(int(r["id"]))
 
+    def rename_object(self, old_name: str, new_name: str) -> bool:
+        """Rename an object. Returns False if old_name missing or new_name taken.
+
+        Uses EXACT name matching — find_by_name() is fuzzy (LIKE), which would
+        treat "牛奶瓶" as already taken when "这是牛奶瓶" exists.
+        """
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM objects WHERE user_name = ?", (old_name,)
+            ).fetchone()
+            if not row:
+                return False
+            oid = int(row["id"])
+            dup = self._conn.execute(
+                "SELECT id FROM objects WHERE user_name = ? AND id != ?",
+                (new_name, oid),
+            ).fetchone()
+            if dup:
+                return False  # exact name already exists
+            self._conn.execute(
+                "UPDATE objects SET user_name = ?, updated_at = ? WHERE id = ?",
+                (new_name, time.strftime("%Y-%m-%d %H:%M:%S"), oid),
+            )
+            self._conn.commit()
+            log.info("Renamed object %r -> %r (id=%d)", old_name, new_name, oid)
+            return True
+
     def delete_object(self, name_or_id) -> bool:
         with self._lock:
             if isinstance(name_or_id, str):
@@ -368,6 +503,7 @@ class VisualMemory:
             self._conn.commit()
             self._drop_object_rows(oid)
             self._save_index()
+            self._refresh_centered()
             return True
 
     def stats(self) -> dict:

@@ -1,0 +1,95 @@
+app:
+  camera_index: 0
+  height: 1080
+  locale: zh
+  text_input: false
+  text_input_always: false
+  ui_fps_target: 30
+  width: 1920
+asr:
+  cmvn: models/sherpa-onnx-paraformer-zh-int8/am.mvn
+  decoder: models/sherpa-onnx-paraformer-zh-int8/decoder.int8.onnx
+  device: cpu
+  e2e_model: models/sherpa-onnx-paraformer-zh-int8/model.int8.onnx
+  enabled: true
+  encoder: models/sherpa-onnx-paraformer-zh-int8/model.int8.onnx
+  max_end_silence_ms: 2500
+  min_speech_ms: 250
+  model_dir: models/sherpa-onnx-paraformer-zh-int8
+  num_threads: 4
+  sample_rate: 16000
+  tokens: models/sherpa-onnx-paraformer-zh-int8/tokens.txt
+  vad_model: models/silero_vad/silero_vad.onnx
+debug:
+  dir: data/debug
+  enabled: true
+depth:
+  decoder_path: models/mobile_sam/mobilesam_decoder.onnx
+  enabled: true
+  encoder_path: models/mobile_sam/mobilesam_encoder.onnx
+  expand_ratio: 0.06
+  input_size: 518
+  max_area_frac: 0.45
+  min_area_frac: 0.005
+  min_idle_sec: 0.12
+  model_path: models/depth_anything_v2/depth_anything_v2_vits.onnx
+  near_percentile: 80.0
+  onnx_threads: 4
+  refresh_interval_sec: 0.5
+  show_depth_window: false
+  use_mobilesam: false
+memory:
+  center_features: true
+  center_roi_frac: 0.45
+  db_path: data/visual_memory.db
+  embeddings_path: data/resnet18_embeddings.npz
+  margin_threshold: 0.05
+  margin_threshold_centered: 0.15
+  match_threshold: 0.7
+  match_threshold_centered: 0.5
+  max_samples: 10
+  min_crop_px: 64
+  min_samples: 3
+  sample_duration_sec: 2.5
+  sample_timeout_sec: 15.0
+  sample_interval_ms: 250
+  samples_dir: data/samples
+  topk: 3
+nlu:
+  min_confidence: 0.6
+resnet18:
+  allow_cpu_fallback: true
+  backend: onnxruntime
+  device: cpu
+  embed_dim: 512
+  enabled: true
+  input_size: 224
+  model_path: models/resnet18/resnet18.onnx
+  onnx_path: models/resnet18/resnet18.onnx
+  precision: FP32
+tts:
+  edge_pitch: +0Hz
+  edge_rate: +0%
+  edge_voice: zh-CN-YunxiNeural
+  enabled: true
+  mock_wav: data/tts_beep.wav
+  mode: edge
+  play_audio: true
+  prompt_lang: zh
+  prompt_text: 对我做了介绍啊那么我想说的话是呢大家如果对我的研究感兴趣呢你
+  ref_audio: models/gpt_sovits/ref_audio.wav
+  server_url: http://127.0.0.1:19880
+  timeout_s: 30
+yolo:
+  allow_cpu_fallback: true
+  backend: onnxruntime
+  class_filter: null
+  conf_threshold: 0.4
+  device: cpu
+  enabled: false
+  every_n_frames: 4
+  input_size: 640
+  model_path: models/yolov8n/yolov8n.onnx
+  nms_threshold: 0.45
+  onnx_path: models/yolov8n/yolov8n.onnx
+  precision: FP32

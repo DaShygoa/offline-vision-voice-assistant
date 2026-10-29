@@ -2,11 +2,11 @@
 """benchmark.py — on-machine performance report (选题一).
 
 Measures:
-  * ResNet18 inference latency  (OpenVINO GPU/CPU, avg / p50 / p95)
+  * ResNet18 inference latency  (ONNX Runtime CPU, avg / p50 / p95)
   * YOLO inference latency      (optional ROI helper)
   * ASR latency                 (Paraformer decode on synthetic/test wav)
   * TTS RTF                     (GPT-SoVITS server or mock)
-  * RAM (process / system), CPU %, iGPU device + utilization (best effort)
+  * RAM (process / system), CPU % (best effort)
 
 Usage:
     python benchmark.py
@@ -88,82 +88,15 @@ def _cpu_info() -> Dict[str, object]:
     }
 
 
-def _openvino_devices() -> Dict[str, object]:
-    info: Dict[str, object] = {"available": [], "gpu_util_percent": None, "error": None}
+def _onnxruntime_info() -> Dict[str, object]:
+    info: Dict[str, object] = {"available": True, "providers": None, "error": None}
     try:
-        import openvino as ov
-
-        core = ov.Core()
-        info["available"] = list(core.available_devices)
-        for d in core.available_devices:
-            try:
-                info[f"{d}_full_name"] = core.get_property(d, "FULL_DEVICE_NAME")
-            except Exception:
-                pass
+        import onnxruntime as ort
+        info["providers"] = ort.get_available_providers()
     except Exception as e:
+        info["available"] = False
         info["error"] = str(e)
-        return info
-    # best-effort GPU utilization via Windows PDH (Intel iGPU)
-    try:
-        util = _windows_gpu_util()
-        if util is not None:
-            info["gpu_util_percent"] = util
-    except Exception:
-        pass
     return info
-
-
-def _windows_gpu_util() -> Optional[float]:
-    """Average 'GPU Engine Utilization' for Intel GPU engines (best effort)."""
-    if sys.platform != "win32":
-        return None
-    try:
-        import win32pdh
-
-        # Query counter path pattern for GPU Engine
-        counter_path = r"\GPU Engine(*)\Utilization Percentage"
-        instances, _ = win32pdh.EnumObjectItems(None, None, "GPU Engine", win32pdh.PERF_DETAIL_WIZARD)
-        # gather instances of type luid & pid & engtype
-        eng_instances = [i for i in instances[0] if i.endswith("engtype_3D") or i.endswith("engtype_Copy") or i.endswith("engtype_VideoDecode") or i.endswith("engtype_Other")]
-        if not eng_instances:
-            eng_instances = list(instances[0])[:20]
-        values = []
-        query = win32pdh.Query()
-        counters = []
-        for inst in eng_instances[:40]:
-            path = win32pdh.MakeCounterPath((None, "GPU Engine", inst, None, None, win32pdh.WILD_CARD_INSTANCE, None))
-            try:
-                h = query.AddCounter(path)
-                counters.append(h)
-            except Exception:
-                continue
-        if not counters:
-            return None
-        # sample a few times
-        samples = []
-        for _ in range(5):
-            win32pdh.CollectQueryData(query)
-            try:
-                _, _, values = win32pdh.GetFormattedCounterValues(counters[0], win32pdh.PDH_FMT_DOUBLE)
-                # actually need per-counter; use CollectQueryData with all
-            except Exception:
-                pass
-            time.sleep(0.2)
-        # simpler aggregate: use GetFormattedCounterArray if available
-        max_util = 0.0
-        for h in counters:
-            try:
-                _, vals = win32pdh.GetFormattedCounterArray(h, win32pdh.PDH_FMT_DOUBLE)
-                for v in vals:
-                    try:
-                        max_util = max(max_util, float(v[1]))
-                    except Exception:
-                        pass
-            except Exception:
-                continue
-        return round(max_util, 1) if max_util > 0 else None
-    except Exception:
-        return None
 
 
 def _synth_wav(path: str, seconds: float = 1.6, sr: int = 16000) -> str:
@@ -434,7 +367,7 @@ def main(argv=None) -> int:
         report["frame_source"] = "camera"
 
     if not args.skip_system:
-        report["openvino"] = _openvino_devices()
+        report["onnxruntime"] = _onnxruntime_info()
         report["cpu"] = _cpu_info()
         report["ram"] = _system_ram()
         report["process_ram_mb_baseline"] = round(_process_ram_mb(), 1)

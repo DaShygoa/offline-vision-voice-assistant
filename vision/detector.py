@@ -1,9 +1,9 @@
 """YOLOv8n object detector.
 
-Deployment rules (target machine has NO NVIDIA GPU):
-  * Primary backend = OpenVINO  (Intel iGPU first, CPU fallback, FP16/INT8 configurable)
-  * Fallback backend = OpenCV DNN (readNetFromONNX) — keeps the OpenCV course-project flavor
-  * NEVER assumes CUDA / TensorRT.
+Deployment rules (CPU only, NO OpenVINO, NO CUDA):
+  * Primary backend = ONNX Runtime CPU
+  * Fallback backend = OpenCV DNN (readNetFromONNX)
+  * NEVER assumes CUDA / TensorRT / OpenVINO.
 
 Detection is intended to run every N frames (not every frame) from a worker thread.
 """
@@ -14,7 +14,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -79,7 +79,7 @@ class YoloDetector:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.backend = str(cfg.get("backend", "openvino")).lower()
+        self.backend = str(cfg.get("backend", "onnxruntime")).lower()
         self.device_pref = str(cfg.get("device", "GPU")).upper()
         self.precision = str(cfg.get("precision", "FP16")).upper()
         self.conf_th = float(cfg.get("conf_threshold", 0.40))
@@ -95,23 +95,16 @@ class YoloDetector:
 
     # ------------------------------------------------------------------ load
     def load(self) -> None:
-        if self.backend == "openvino":
+        if self.backend == "onnxruntime":
             try:
-                self._load_openvino()
+                self._load_onnxruntime()
                 self.ready = True
                 return
             except Exception as e:
                 if not self.cfg.get("allow_cpu_fallback", True):
                     raise
-                log.warning("OpenVINO GPU load failed (%s), falling back to CPU", e)
-                try:
-                    self.device_pref = "CPU"
-                    self._load_openvino()
-                    self.ready = True
-                    return
-                except Exception as e2:
-                    log.warning("OpenVINO CPU failed (%s), trying OpenCV DNN", e2)
-                    self.backend = "opencv_dnn"
+                log.warning("ONNX Runtime load failed (%s), falling back to OpenCV DNN", e)
+                self.backend = "opencv_dnn"
 
         if self.backend == "opencv_dnn":
             self._load_opencv_dnn()
@@ -121,79 +114,22 @@ class YoloDetector:
         raise RuntimeError(f"Unknown YOLO backend: {self.backend}")
 
     def _resolve_model_path(self) -> str:
-        precision = self.precision
-        if precision == "INT8":
-            p = self.cfg.get("precision_int8_path")
-            if p and os.path.isfile(p):
-                return p
-            log.warning("INT8 model not found at %s, using default model", p)
-        path = self.cfg.get("model_path", "")
+        path = self.cfg.get("onnx_path") or self.cfg.get("model_path", "")
         if path and os.path.isfile(path):
             return path
-        # try converting ONNX -> IR on the fly
-        onnx = self.cfg.get("onnx_path", "")
-        if onnx and os.path.isfile(onnx) and onnx.endswith(".onnx"):
-            ir = self._convert_onnx_to_ir(onnx)
-            if ir:
-                return ir
         raise FileNotFoundError(
-            f"YOLO model not found. expected IR={path} onnx={onnx}"
+            f"YOLO ONNX model not found: {path}. Run: python tools/prepare_models.py --yolo"
         )
 
-    def _convert_onnx_to_ir(self, onnx_path: str) -> Optional[str]:
-        try:
-            import openvino as ov
-            out_dir = os.path.dirname(onnx_path)
-            ov_path = os.path.join(out_dir, os.path.splitext(os.path.basename(onnx_path))[0] + ".xml")
-            if os.path.isfile(ov_path):
-                return ov_path
-            log.info("Converting %s -> OpenVINO IR ...", onnx_path)
-            ov.convert_model(onnx_path, output_model=ov_path)
-            return ov_path
-        except Exception as e:
-            log.warning("ONNX->IR conversion failed: %s", e)
-            return None
+    def _load_onnxruntime(self) -> None:
+        import onnxruntime as ort
 
-    def _load_openvino(self) -> None:
-        import openvino as ov
-
-        core = ov.Core()
-        available = list(core.available_devices)
-        log.info("OpenVINO devices: %s", available)
-
-        model_path = self._resolve_model_path()
-        if model_path.endswith(".onnx"):
-            model = core.read_model(model_path)
-        else:
-            model = core.read_model(model_path)
-
-        device = self._pick_device(core, available)
-        config = {"PERFORMANCE_HINT": "LATENCY"}
-        # GPU on Intel automatically runs FP16 shaders for FP32 IR;
-        # for explicit precision we just record it (INT8 uses a quantized IR file).
-        try:
-            compiled = core.compile_model(model, device, config)
-        except Exception as e:
-            if device != "CPU" and self.cfg.get("allow_cpu_fallback", True):
-                log.warning("compile on %s failed (%s), fallback CPU", device, e)
-                device = "CPU"
-                compiled = core.compile_model(model, device, config)
-            else:
-                raise
-        self._backend_impl = ("openvino", compiled, compiled.input(0), compiled.outputs[0])
-        self.device_used = f"OpenVINO:{device}:{self.precision}"
-        self.backend = "openvino"
-        log.info("YOLO loaded on %s (%s)", device, model_path)
-
-    def _pick_device(self, core, available: Sequence[str]) -> str:
-        prefer_gpu = self.device_pref in ("GPU", "AUTO", "GPU.0")
-        if prefer_gpu:
-            if any(d == "GPU" or d.startswith("GPU.") for d in available):
-                return "GPU"
-            if not self.cfg.get("allow_cpu_fallback", True):
-                raise RuntimeError("GPU requested but not available")
-            return "CPU"
-        return "CPU"
+        path = self._resolve_model_path()
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        self._backend_impl = ("onnxruntime", sess, sess.get_inputs()[0].name)
+        self.device_used = "ONNXRuntime:CPU"
+        self.backend = "onnxruntime"
+        log.info("YOLO loaded via ONNX Runtime CPU (%s)", path)
 
     def _load_opencv_dnn(self) -> None:
         onnx = self.cfg.get("onnx_path") or self.cfg.get("model_path", "")
@@ -241,14 +177,13 @@ class YoloDetector:
         blob = np.ascontiguousarray(blob, dtype=np.float32)[None] / 255.0
 
         kind, impl = self._backend_impl[0], self._backend_impl[1]
-        if kind == "openvino":
-            out = impl([blob])
-            pred = next(iter(out.values()))  # (1, 84, 8400)
+        if kind == "onnxruntime":
+            inp_name = self._backend_impl[2]
+            pred = impl.run(None, {inp_name: blob})[0]  # (1, 84, 8400)
         else:
             impl.setInput(blob)
             names = impl.getUnconnectedOutLayersNames()
             outs = impl.forward(names)
-            # YOLOv8 ONNX via OpenCV usually returns one (1,84,8400)
             pred = outs[0] if len(outs) == 1 else np.concatenate(outs, axis=0)
 
         detections = self._postprocess(pred, w, h, s)

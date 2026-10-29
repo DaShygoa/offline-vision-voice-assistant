@@ -115,6 +115,8 @@ class ParaformerASR:
         import onnxruntime as ort
 
         so = ort.SessionOptions()
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        so.add_session_config_entry("session.inter_op.allow_spinning", "0")
         so.intra_op_num_threads = self.num_threads
         so.inter_op_num_threads = max(1, self.num_threads // 2)
         so.log_severity_level = 3

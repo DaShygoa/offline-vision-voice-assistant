@@ -44,12 +44,18 @@ class Intent:
 _LAB = r"[一-龥A-Za-z0-9_·\-]{1,32}"
 
 _REMEMBER_PATTERNS = [
-    # 记住，这个叫XXX / 记住这个叫XXX
-    re.compile(rf"记住[，,、\s]*(?:这个|它|这东西)?\s*(?:叫|称为|叫做|名字是|名字叫)\s*(?P<label>{_LAB})"),
+    # 记住这个 / 记住它 / 记住这东西（无名字，触发"问名字"流程）
+    re.compile(r"^记住\s*[，,、]?\s*(?:这个|它|这东西|这个东西)$"),
+    # 记住这个是/叫 XXX · 记住这是XXX · 记住是/叫 XXX · 记住，这个叫XXX
+    # (口语里常用「是」而非「叫」：记住这个是充电宝)
+    re.compile(rf"记住[，,、\s]*(?:这个|它|这东西|这个东西|这)?\s*(?:是|叫|就是|称为|叫做|名字是|名字叫)\s*(?P<label>{_LAB})"),
     # 把这个/这/它 叫做 XXX
-    re.compile(rf"把(?:这个|这|它)\s*(?:叫做|叫|称为|命名为|起名为)\s*(?P<label>{_LAB})"),
-    # 记住 XXX（无「叫」）— 排除「记住了什么/哪些」
-    re.compile(rf"记住\s*[，,、]?\s*(?P<label>{_LAB})\s*$"),
+    re.compile(rf"把(?:这个|这|它)\s*(?:叫做|叫|称为|命名为|起名为|是)\s*(?P<label>{_LAB})"),
+    # 这是 XXX / 这叫 XXX —— 陈述句式录入（对着物体说出名字）
+    # lookahead 排除疑问词，让「这是什么」落到 IDENTIFY
+    re.compile(rf"^这\s*(?:是|就是|就叫|叫|叫做)\s*(?P<label>(?!什么|啥|哪个|哪)[一-龥A-Za-z0-9_·\-]{{1,32}})$"),
+    # 记住 XXX（无「叫」）— 排除「记住了什么/哪些」和「这个/它/这是」
+    re.compile(rf"记住\s*[，,、]?\s*(?P<label>(?!这是|这个|它|这东西|什么|哪些)[一-龥A-Za-z0-9_·\-]{{1,32}})\s*$"),
     # 这个是/叫 XXX，记住
     re.compile(rf"(?:这个|它)\s*(?:叫|是|叫做)\s*(?P<label>{_LAB})\s*[，,]?\s*记住"),
     # 名字叫 XXX
@@ -87,6 +93,13 @@ _HELP_PATTERNS = [
 ]
 
 
+def _clean_label(label: str) -> str:
+    """Strip filler prefixes so '这是牛奶瓶' / '这个是充电宝' yield the bare name."""
+    label = (label or "").strip("，,、。！？!? \t")
+    label = re.sub(r"^(这是|这个是|那个是|它是|它就是|是个|就是|是)\s*", "", label)
+    return label.strip("，,、。！？!? \t")
+
+
 def _try(patterns, text: str) -> Optional[re.Match]:
     for p in patterns:
         m = p.search(text)
@@ -95,13 +108,47 @@ def _try(patterns, text: str) -> Optional[re.Match]:
     return None
 
 
+# Common ASR mis-transcriptions that flip the intent word. Paraformer sometimes
+# hears 记住 as 技术/记住/即是 — normalise before pattern matching.
+_ASR_FIX = [
+    (re.compile(r"^技术"), "记住"),
+    (re.compile(r"^即是"), "记住"),
+    (re.compile(r"技术(?=这个|它|是|叫)"), "记住"),
+    # redundant filler words: "记住这个东西这个是手柄" → "记住这个是手柄"
+    (re.compile(r"这个东西这个"), "这个"),
+    (re.compile(r"这个东西(?=是|叫)"), "这个"),
+    (re.compile(r"那个东西那个"), "那个"),
+    (re.compile(r"这东西这个"), "这个"),
+    # repeated demonstratives: "记住这个这个是牛奶瓶" → "记住这个是牛奶瓶"
+    # (+) collapses any run of repeats in one pass
+    (re.compile(r"(这个)+"), "这个"),
+    (re.compile(r"(那个)+"), "那个"),
+    (re.compile(r"(它)+"), "它"),
+    (re.compile(r"(是)+"), "是"),
+    (re.compile(r"(叫)+"), "叫"),
+    # duplicated single 「这」 before a verb: "记住这个这是手机" → "记住这个是手机"
+    (re.compile(r"(这个)这(?=是|叫)"), "这个"),
+    (re.compile(r"(这)这(?=是|叫)"), "这"),
+    (re.compile(r"(这)是(?=这)"), "这"),
+]
+
 def parse_intent(text: str) -> Intent:
     raw = (text or "").strip()
-    # remove ASR punctuation noise
-    t = re.sub(r"[。！？!?，,、；;：:\s]+", lambda m: " " if m.group()[:1].isspace() or m.group() in " \t" else "", raw)
-    t = re.sub(r"\s+", " ", raw).strip()
+    # 1) remove punctuation noise
+    t = re.sub(r"[。！？!?，,、；;：:…\-_\"'“”‘’()（）\[\]【】]+", "", raw)
+    # 2) remove ALL whitespace — Paraformer often inserts spaces between CJK chars
+    #    e.g. "这 是 什 么" → "这是什么" (patterns expect no spaces)
+    t = re.sub(r"\s+", "", t).strip()
     if not t:
         return Intent(IntentType.UNKNOWN, raw_text=raw, confidence=0.0)
+    # fix ASR mis-hearings before matching (记住 ← 技术/即是). Run to a fixed
+    # point: a phrase like "记住这个这这是手机" needs several passes to collapse.
+    for _ in range(4):
+        before = t
+        for pat, repl in _ASR_FIX:
+            t = pat.sub(repl, t)
+        if t == before:
+            break
 
     # LIST before REMEMBER — 「你记住了什么」 would otherwise match 记住…
     m = _try(_LIST_PATTERNS, t)
@@ -111,7 +158,7 @@ def parse_intent(text: str) -> Intent:
     # REMEMBER — check before SEARCH (「记住，这个叫…」 contains 叫)
     m = _try(_REMEMBER_PATTERNS, t)
     if m:
-        label = (m.groupdict().get("label") or "").strip("，,、。 ")
+        label = _clean_label(m.groupdict().get("label") or "")
         if label:
             return Intent(IntentType.REMEMBER, label=label, raw_text=raw, confidence=0.95)
         # "记住这个" without a name → ask for name handled by app with IDENTIFY-like teaching
@@ -119,7 +166,7 @@ def parse_intent(text: str) -> Intent:
 
     m = _try(_SEARCH_PATTERNS, t)
     if m:
-        label = (m.groupdict().get("label") or "").strip("，,、。 ")
+        label = _clean_label(m.groupdict().get("label") or "")
         if label.endswith("在") and not label.endswith("还在"):
             label = label[:-1].strip()
         if label and not re.fullmatch(r"这是什么|什么|哪", label):
@@ -127,7 +174,7 @@ def parse_intent(text: str) -> Intent:
 
     m = _try(_FORGET_PATTERNS, t)
     if m:
-        label = (m.groupdict().get("label") or "").strip()
+        label = _clean_label(m.groupdict().get("label") or "")
         return Intent(IntentType.FORGET, label=label, raw_text=raw, confidence=0.9)
 
     m = _try(_IDENTIFY_PATTERNS, t)

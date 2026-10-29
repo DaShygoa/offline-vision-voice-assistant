@@ -1,8 +1,7 @@
 """ImageNet-pretrained ResNet18 visual feature extractor (选题一).
 
-Backends (NO PyTorch at runtime):
-  * OpenVINO  (preferred — Intel iGPU / CPU, FP16)
-  * ONNX Runtime CPU (fallback)
+Backend (CPU only, NO PyTorch, NO OpenVINO):
+  * ONNX Runtime CPU (primary and only)
 
 Feature = avgpool output (512-d, before fc), L2-normalized for cosine retrieval.
 The model only runs on identify / remember / search — never in the camera hot path.
@@ -14,6 +13,7 @@ Model prep (one-time, needs torch once):
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import List, Optional, Sequence
 
@@ -30,80 +30,43 @@ _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 class ResNet18Extractor:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.backend = str(cfg.get("backend", "openvino")).lower()
+        self.backend = str(cfg.get("backend", "onnxruntime")).lower()
         self.device_pref = str(cfg.get("device", "GPU")).upper()
         self.precision = str(cfg.get("precision", "FP16")).upper()
         self.input_size = int(cfg.get("input_size", 224))
         self.embed_dim = int(cfg.get("embed_dim", 512))
+        self.num_threads = int(cfg.get("num_threads", 4))
         self.device_used = "none"
         self.ready = False
         self._impl = None
 
     def load(self) -> None:
-        path = self.cfg.get("model_path", "")
-        if not path:
+        path = self.cfg.get("onnx_path") or self.cfg.get("model_path", "")
+        if not path or not os.path.isfile(path):
             raise FileNotFoundError(
-                "resnet18.model_path not configured — run: python tools/prepare_models.py --resnet18"
+                "resnet18.onnx_path not configured or file missing — run: python tools/prepare_models.py --resnet18"
             )
-        onnx_path = self.cfg.get("onnx_path", "")
-        if self.backend == "openvino":
-            try:
-                self._load_openvino(path)
-                self.ready = True
-                return
-            except Exception as e:
-                if not self.cfg.get("allow_cpu_fallback", True):
-                    raise
-                log.warning("ResNet18 OpenVINO GPU failed (%s), CPU fallback", e)
-                try:
-                    self.device_pref = "CPU"
-                    self._load_openvino(path)
-                    self.ready = True
-                    return
-                except Exception as e2:
-                    log.warning("ResNet18 OpenVINO failed (%s), ONNX Runtime fallback", e2)
-                    self.backend = "onnxruntime"
-                    path = onnx_path or path
-        if self.backend == "onnxruntime":
-            self._load_ort(onnx_path or path)
-            self.ready = True
-            return
-        raise RuntimeError(f"Unknown ResNet18 backend: {self.backend}")
-
-    def _load_openvino(self, path: str) -> None:
-        import openvino as ov
-
-        core = ov.Core()
-        available = list(core.available_devices)
-        model = core.read_model(path)
-        device = "CPU"
-        if self.device_pref in ("GPU", "AUTO") and any(
-            d == "GPU" or d.startswith("GPU.") for d in available
-        ):
-            device = "GPU"
-        config = {"PERFORMANCE_HINT": "LATENCY"}
-        try:
-            compiled = core.compile_model(model, device, config)
-        except Exception as e:
-            if device != "CPU":
-                log.warning("ResNet18 compile GPU failed (%s), CPU", e)
-                device = "CPU"
-                compiled = core.compile_model(model, "CPU", config)
-            else:
-                raise
-        self._impl = ("openvino", compiled, compiled.input(0), compiled.outputs[0])
-        self.device_used = f"OpenVINO:{device}:{self.precision}"
-        self.backend = "openvino"
-        log.info("ResNet18 loaded on %s (%s)", device, path)
+        self._load_ort(path)
+        self.ready = True
+        return
 
     def _load_ort(self, path: str) -> None:
         import onnxruntime as ort
 
-        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        # Without explicit options ORT uses every core and busy-waits between
+        # runs, which kept several CPU cores hot even while recognition was
+        # paused. Pin the thread count and disable spin-waiting.
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = max(1, int(self.num_threads))
+        so.inter_op_num_threads = 1
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        so.add_session_config_entry("session.inter_op.allow_spinning", "0")
+
+        sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
         self._impl = ("onnxruntime", sess, sess.get_inputs()[0].name, None)
         self.device_used = "ONNXRuntime:CPU"
         self.backend = "onnxruntime"
-        log.info("ResNet18 loaded via ONNX Runtime CPU (%s)", path)
+        log.info("ResNet18 loaded via ONNX Runtime CPU (%s, threads=%d)", path, self.num_threads)
 
     # ------------------------------------------------------------------ util
     def preprocess(self, crop_bgr: np.ndarray) -> np.ndarray:
@@ -127,15 +90,9 @@ class ResNet18Extractor:
         if min(crop_bgr.shape[:2]) < 16:
             return None
         blob = self.preprocess(crop_bgr)
-        kind = self._impl[0]
         try:
-            if kind == "openvino":
-                compiled, inp, out = self._impl[1], self._impl[2], self._impl[3]
-                out_blob = compiled({inp: blob})
-                feat = out_blob[out]
-            else:
-                sess, inp_name = self._impl[1], self._impl[2]
-                feat = sess.run(None, {inp_name: blob})[0]
+            sess, inp_name = self._impl[1], self._impl[2]
+            feat = sess.run(None, {inp_name: blob})[0]
         except Exception as e:
             log.error("ResNet18 infer failed: %s", e)
             return None

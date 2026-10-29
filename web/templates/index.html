@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>离线物体识别 Demo</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0f1117; color:#e2e8f0; font-family:"Microsoft YaHei",-apple-system,sans-serif; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+
+  /* ── top status bar ── */
+  .topbar { background:#1a1d27; padding:0 20px; height:48px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #2a2d3a; flex-shrink:0; }
+  .topbar .brand { font-size:15px; font-weight:500; }
+  .topbar .brand span { color:#818cf8; }
+  .topbar .stats { display:flex; gap:14px; align-items:center; }
+  .stat-chip { background:#252836; border-radius:6px; padding:4px 10px; font-size:11px; display:flex; align-items:center; gap:5px; }
+  .stat-chip .dot { width:6px; height:6px; border-radius:50%; background:#34d399; }
+  .stat-chip .dot.off { background:#f87171; }
+  .stat-chip .val { color:#94a3b8; } .stat-chip .val b { color:#e2e8f0; font-weight:500; }
+  .fps-badge { background:#312e81; color:#a5b4fc; padding:3px 12px; border-radius:12px; font-size:12px; font-weight:500; }
+  .recog-btn { background:#065f46; color:#a7f3d0; border:1px solid #10b981; border-radius:6px; padding:4px 14px; font-size:12px; font-weight:500; cursor:pointer; font-family:inherit; white-space:nowrap; }
+  .recog-btn:hover { background:#047857; color:#fff; }
+  .recog-btn.paused { background:#7f1d1d; color:#fecaca; border-color:#ef4444; }
+  .recog-btn.paused:hover { background:#991b1b; color:#fff; }
+  .recog-btn:disabled { opacity:.5; cursor:not-allowed; }
+  .dev-chip { background:#252836; color:#94a3b8; border:1px solid #2a2d3a; border-radius:6px; padding:4px 10px; font-size:11px; cursor:pointer; display:flex; align-items:center; gap:5px; font-family:inherit; }
+  .dev-chip .dot { width:6px; height:6px; border-radius:50%; background:#34d399; }
+  .dev-chip.off { color:#64748b; }
+  .dev-chip.off .dot { background:#64748b; }
+  .dev-chip:hover { border-color:#4f46e5; color:#c7d2fe; }
+
+  /* ── main row: video + right panel ── */
+  .main { flex:1; display:flex; overflow:hidden; }
+
+  /* left: camera (takes most space) */
+  .video-area { flex:1; padding:16px; display:flex; flex-direction:column; }
+  .video-wrap { flex:1; border-radius:12px; overflow:hidden; background:#000; position:relative; }
+  .video-wrap img { width:100%; height:100%; object-fit:contain; }
+  .video-label { position:absolute; top:10px; left:12px; background:rgba(0,0,0,0.6); color:#94a3b8; font-size:11px; padding:3px 10px; border-radius:4px; }
+
+  /* right panel */
+  .right-panel { width:380px; display:flex; flex-direction:column; border-left:1px solid #2a2d3a; background:#151822; }
+
+  /* right: depth heatmap at TOP */
+  .depth-box { padding:14px 16px 10px; border-bottom:1px solid #1e2230; }
+  .depth-box h3 { font-size:12px; color:#94a3b8; margin-bottom:8px; font-weight:500; }
+  .depth-box .thumb { border-radius:10px; overflow:hidden; background:#000; height:200px; position:relative; }
+  .depth-box .thumb img { width:100%; height:100%; object-fit:cover; }
+  .depth-box .tag { position:absolute; bottom:8px; left:10px; background:rgba(0,0,0,0.6); color:#94a3b8; font-size:10px; padding:2px 8px; border-radius:3px; }
+
+  /* right: object manager */
+  .obj-section { flex:1; overflow-y:auto; padding:10px 0; }
+  .obj-section h3 { font-size:12px; color:#94a3b8; padding:6px 18px 8px; font-weight:500; }
+  .obj-section::-webkit-scrollbar { width:4px; }
+  .obj-section::-webkit-scrollbar-thumb { background:#2a2d3a; border-radius:2px; }
+  .obj-item { display:flex; align-items:center; justify-content:space-between; padding:8px 18px; }
+  .obj-item:hover { background:#1e2230; }
+  .obj-item .name { font-size:13px; font-weight:500; }
+  .obj-item .meta { font-size:10px; color:#64748b; }
+  .obj-item .del { background:transparent; color:#f87171; border:1px solid #7f1d1d; border-radius:5px; padding:2px 10px; font-size:10px; cursor:pointer; }
+  .obj-item .del:hover { background:#7f1d1d; color:#fff; }
+  .obj-item .ren { background:transparent; color:#60a5fa; border:1px solid #1e3a5f; border-radius:5px; padding:2px 10px; font-size:10px; cursor:pointer; margin-right:4px; }
+  .obj-item .ren:hover { background:#1e3a5f; color:#fff; }
+  .obj-item .btns { display:flex; gap:4px; }
+  .obj-item input.ren-input { background:#0a1628; border:1px solid #4f46e5; border-radius:5px; padding:3px 8px; color:#e2e8f0; font-size:12px; width:120px; outline:none; }
+  .obj-item .thumb { width:46px; height:46px; border-radius:6px; object-fit:cover; background:#0a1628; border:1px solid #2a2d3a; cursor:pointer; flex-shrink:0; }
+  .obj-item .thumb:hover { border-color:#6366f1; }
+  .obj-empty { padding:20px; text-align:center; font-size:12px; color:#475569; }
+
+  /* right: quick commands */
+  .cmd-section { border-top:1px solid #1e2230; padding:12px 16px; }
+  .cmd-section .quick-row { display:flex; gap:6px; flex-wrap:wrap; }
+  .cmd-section .quick-row button { background:#1e2230; color:#94a3b8; border:1px solid #2a2d3a; border-radius:16px; padding:5px 14px; font-size:11px; cursor:pointer; }
+  .cmd-section .quick-row button:hover { color:#a5b4fc; border-color:#4f46e5; }
+
+  /* ═══ bottom chat bar (full width) ═══ */
+  .chat-bar { background:#1a1d27; border-top:1px solid #2a2d3a; padding:0 20px; flex-shrink:0; display:flex; flex-direction:column; height:220px; }
+  .chat-messages { flex:1; overflow-y:auto; padding:12px 0; display:flex; flex-direction:column; gap:8px; }
+  .chat-messages::-webkit-scrollbar { width:4px; }
+  .chat-messages::-webkit-scrollbar-thumb { background:#2a2d3a; border-radius:2px; }
+  .chat-msg { padding:8px 14px; border-radius:14px; font-size:13px; line-height:1.55; max-width:55%; word-break:break-all; }
+  .chat-msg.user { background:#4338ca; color:#e0e7ff; align-self:flex-end; border-bottom-right-radius:3px; }
+  .chat-msg.bot { background:#2a2e3d; color:#e2e8f0; align-self:flex-start; border-bottom-left-radius:3px; }
+  .chat-msg .tag { display:block; font-size:10px; margin-bottom:2px; opacity:0.7; }
+  .chat-msg.user .tag { color:#a5b4fc; }
+  .chat-msg.bot .tag { color:#818cf8; }
+  .chat-msg.sys { background:transparent; color:#64748b; font-size:11px; align-self:center; padding:2px 0; }
+  .chat-input-row { display:flex; gap:10px; align-items:center; padding:10px 0 14px; border-top:1px solid #1e2230; }
+  .chat-input-row input { flex:1; background:#1e2230; border:1px solid #2a2d3a; border-radius:10px; padding:11px 16px; color:#e2e8f0; font-size:13px; outline:none; }
+  .chat-input-row input:focus { border-color:#818cf8; }
+  .chat-input-row button { background:#4f46e5; color:#fff; border:none; border-radius:10px; padding:11px 24px; font-size:13px; cursor:pointer; font-weight:500; }
+  .chat-input-row button:hover { background:#6366f1; }
+</style>
+</head>
+<body>
+
+<!-- top status bar -->
+<div class="topbar">
+  <div class="brand">离线物体识别 <span>· ResNet18 + 深度零样本定位</span></div>
+  <div class="stats">
+    <div class="stat-chip"><div class="dot" id="dot-resnet"></div><div class="val">ResNet18 <b id="s-resnet">--</b></div></div>
+    <div class="stat-chip"><div class="dot" id="dot-depth"></div><div class="val">Depth <b id="s-depth">--</b></div></div>
+    <div class="stat-chip"><div class="dot"></div><div class="val">已录入 <b id="s-mem">0</b></div></div>
+    <div class="stat-chip"><div class="dot" id="dot-asr"></div><div class="val">ASR <b id="s-asr">--</b></div></div>
+    <div class="fps-badge" id="fps-badge">-- FPS</div>
+    <button class="dev-chip" id="chip-cam" onclick="toggleDevice('camera')" title="开关摄像头"><span class="dot"></span>摄像头</button>
+    <button class="dev-chip" id="chip-mic" onclick="toggleDevice('mic')" title="开关麦克风"><span class="dot"></span>麦克风</button>
+    <button class="recog-btn" id="recog-btn" onclick="toggleRecognition()">暂停识别</button>
+  </div>
+</div>
+
+<!-- main: video left + right panel -->
+<div class="main">
+  <div class="video-area">
+    <div class="video-wrap">
+      <img id="video" src="/video" alt="camera">
+      <div class="video-label">摄像头画面</div>
+    </div>
+  </div>
+
+  <div class="right-panel">
+    <!-- depth heatmap at TOP RIGHT -->
+    <div class="depth-box">
+      <h3>深度热力图</h3>
+      <div class="thumb">
+        <img id="depth" src="/depth" alt="depth">
+        <div class="tag">暖色=近 · 冷色=远</div>
+      </div>
+    </div>
+
+    <!-- object manager -->
+    <div class="obj-section">
+      <h3>识别库管理</h3>
+      <div id="obj-list"><div class="obj-empty">识别库为空</div></div>
+    </div>
+
+    <!-- quick commands -->
+    <div class="cmd-section">
+      <div class="quick-row">
+        <button onclick="quickCmd('这是什么？')">这是什么？</button>
+        <button onclick="startRemember()">记住这个</button>
+        <button onclick="quickCmd('你记住了什么')">已录入列表</button>
+        <button onclick="quickCmd('你能做什么')">帮助</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ bottom chat bar (full width) ═══ -->
+<div class="chat-bar">
+  <div class="chat-messages" id="chat-messages">
+    <div class="chat-msg sys">系统就绪</div>
+  </div>
+  <div class="chat-input-row">
+    <input id="cmd-input" type="text" placeholder="输入指令… 如：这是什么？" onkeydown="if(event.key==='Enter')sendCmd()">
+    <button onclick="sendCmd()">发送</button>
+  </div>
+</div>
+
+<script>
+function addMsg(type, text, tag) {
+  const el = document.getElementById('chat-messages');
+  const div = document.createElement('div');
+  div.className = 'chat-msg ' + type;
+  if (tag) div.innerHTML = `<span class="tag">${tag}</span>${text}`;
+  else div.textContent = text;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+  return div;
+}
+
+let loadingEl = null;
+function showLoading(text) {
+  hideLoading();
+  loadingEl = addMsg('bot', text || '正在识别…', '助手');
+  loadingEl.style.opacity = '0.55';
+}
+function hideLoading() {
+  if (loadingEl) { loadingEl.remove(); loadingEl = null; }
+}
+
+let lastReply = '', lastSubtitle = '';
+let chatSince = 0;
+
+async function pollChat() {
+  try {
+    const res = await fetch('/chat?since=' + chatSince);
+    const data = await res.json();
+    if (data.messages && data.messages.length) {
+      for (const m of data.messages) {
+        if (m.role === 'user') {
+          hideLoading();
+          addMsg('user', m.text, '语音');
+          showLoading('正在识别…');
+        } else if (m.role === 'bot') {
+          hideLoading();
+          addMsg('bot', m.text, '助手');
+          if (/记住|录入|删除|重命名|已忘|忘记/.test(m.text)) refreshObjects();
+        } else {
+          addMsg('sys', m.text);
+        }
+      }
+      chatSince = data.now;
+    }
+  } catch(e) {}
+  setTimeout(pollChat, 400);
+}
+
+async function sendCmd() {
+  const input = document.getElementById('cmd-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  input.placeholder = '输入指令… 如：这是什么？';
+  addMsg('user', text, '你');
+  showLoading('正在识别…');
+  try {
+    await fetch('/command', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
+  } catch(e) { hideLoading(); }
+}
+
+function quickCmd(text) {
+  document.getElementById('cmd-input').value = text;
+  sendCmd();
+}
+
+function syncRecognitionBtn(enabled) {
+  const b = document.getElementById('recog-btn');
+  if (!b) return;
+  b.textContent = enabled ? '暂停识别' : '开始识别';
+  b.className = 'recog-btn' + (enabled ? '' : ' paused');
+}
+
+function syncDeviceChip(id, on) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'dev-chip' + (on ? '' : ' off');
+}
+
+async function toggleDevice(kind) {
+  try {
+    const res = await fetch('/' + kind, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    });
+    const d = await res.json();
+    if (kind === 'camera') syncDeviceChip('chip-cam', !!d.camera_enabled);
+    else syncDeviceChip('chip-mic', !!d.mic_enabled);
+  } catch(e) { /* keep previous state */ }
+}
+
+async function toggleRecognition() {
+  const b = document.getElementById('recog-btn');
+  b.disabled = true;
+  try {
+    const res = await fetch('/recognition', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    });
+    const d = await res.json();
+    syncRecognitionBtn(!!d.enabled);
+    syncDeviceChip('chip-cam', !!d.camera_enabled);
+    syncDeviceChip('chip-mic', !!d.mic_enabled);
+  } catch(e) {
+    /* keep the previous state on network failure */
+  } finally {
+    b.disabled = false;
+  }
+}
+
+// "记住这个" needs a name from the user — pre-fill the command stem and let
+// them type the object name, then hit Enter.
+function startRemember() {
+  const input = document.getElementById('cmd-input');
+  input.value = '记住这个是';
+  input.placeholder = '输入物体名字后按回车…';
+  input.focus();
+  const end = input.value.length;
+  input.setSelectionRange(end, end);
+}
+
+async function refreshObjects() {
+  try {
+    const res = await fetch('/objects');
+    const data = await res.json();
+    const el = document.getElementById('obj-list');
+    if (!data.objects || !data.objects.length) { el.innerHTML = '<div class="obj-empty">识别库为空</div>'; return; }
+    el.innerHTML = data.objects.map(o =>
+      `<div class="obj-item" data-name="${o.name}">
+        ${o.images ? `<img class="thumb" src="/objects/sample?name=${encodeURIComponent(o.name)}&index=0&t=${Date.now()}" onclick="viewSample('${o.name}')" title="查看录入样本">` : ''}
+        <div><div class="name">${o.name}</div><div class="meta">${o.samples} 个样本</div></div>
+        <div class="btns">
+          <button class="ren" onclick="startRename('${o.name}')">重命名</button>
+          <button class="del" onclick="deleteObject('${o.name}')">删除</button>
+        </div>
+      </div>`
+    ).join('');
+  } catch(e) {}
+}
+
+// Open the enrolled sample images in a new tab so the user can verify quality.
+function viewSample(name) {
+  window.open('/objects/sample?name=' + encodeURIComponent(name) + '&index=0', '_blank');
+}
+
+function startRename(oldName) {
+  const item = document.querySelector(`.obj-item[data-name="${CSS.escape(oldName)}"]`);
+  if (!item) return;
+  const nameEl = item.querySelector('.name');
+  nameEl.innerHTML = `<input class="ren-input" value="${oldName}" onkeydown="if(event.key==='Enter')commitRename(this,'${oldName}');if(event.key==='Escape')refreshObjects()">`;
+  const inp = nameEl.querySelector('input');
+  inp.focus();
+  inp.select();
+}
+
+async function commitRename(inputEl, oldName) {
+  const newName = inputEl.value.trim();
+  if (!newName || newName === oldName) { refreshObjects(); return; }
+  try {
+    const res = await fetch('/objects/rename', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({old_name: oldName, new_name: newName})
+    });
+    const data = await res.json();
+    if (!data.ok) { alert(data.error || '重命名失败'); }
+    refreshObjects();
+  } catch(e) { refreshObjects(); }
+}
+
+async function deleteObject(name) {
+  if (!confirm(`确定删除「${name}」？`)) return;
+  try {
+    await fetch('/objects/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})});
+    refreshObjects(); addMsg('sys', `已删除「${name}」`);
+  } catch(e) {}
+}
+
+async function pollStatus() {
+  try {
+    const res = await fetch('/status');
+    const s = await res.json();
+    if (s.ready) {
+      document.getElementById('fps-badge').textContent = (s.fps||'--') + ' FPS';
+      syncRecognitionBtn(s.recognition_enabled !== false);
+      syncDeviceChip('chip-cam', s.camera_enabled !== false);
+      syncDeviceChip('chip-mic', s.mic_enabled !== false);
+      document.getElementById('s-resnet').textContent = s.resnet18==='off'?'OFF':'CPU';
+      document.getElementById('s-depth').textContent = s.depth==='off'?'OFF':'CPU';
+      document.getElementById('s-mem').textContent = s.mem_objects;
+      const asrEl = document.getElementById('s-asr');
+      const asrDot = document.getElementById('dot-asr');
+      if (!s.voice_enabled) { asrEl.textContent = 'OFF'; asrDot.className = 'dot off'; }
+      else if (s.asr_latency_ms > 0) { asrEl.textContent = s.asr_latency_ms + 'ms'; asrDot.className = 'dot'; }
+      else { asrEl.textContent = '就绪'; asrDot.className = 'dot'; }
+      document.getElementById('dot-resnet').className = 'dot'+(s.resnet18!=='off'?'':' off');
+      document.getElementById('dot-depth').className = 'dot'+(s.depth!=='off'?'':' off');
+      if (s.last_reply && s.last_reply !== lastReply) { lastReply = s.last_reply; }
+    }
+  } catch(e) {}
+  setTimeout(pollStatus, 500);
+}
+refreshObjects(); pollStatus(); pollChat(); setInterval(refreshObjects, 3000);
+</script>
+</body>
+</html>

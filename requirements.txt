@@ -1,11 +1,10 @@
-# Offline vision + voice assistant — target: Windows, Intel iGPU/CPU only (NO CUDA)
+# Offline vision + voice assistant — target: Windows, CPU only (NO CUDA, NO OpenVINO)
 # Python 3.10 / 3.11
 
 # Vision
 opencv-python>=4.8
 numpy>=1.24,<3
-openvino>=2024.4.0
-onnxruntime>=1.18.0          # CPU fallback for ResNet18 / optional AVX speedup
+onnxruntime>=1.18.0          # primary inference backend for YOLO + ResNet18 (CPU)
 
 # Voice
 sherpa-onnx>=1.10.50         # VAD (Silero) + optional sherpa Paraformer path
@@ -19,9 +18,6 @@ edge-tts>=7.0                # default TTS engine (config tts.mode=edge). Needs 
 psutil>=5.9
 pyyaml>=6.0
 tqdm>=4.66
-
-# Optional: Windows GPU-engine utilization counter for benchmark.py (iGPU %)
-pywin32>=306; sys_platform == "win32"
 
 # NOTE: PyTorch is NOT required at runtime.
 # GPT-SoVITS runs as an independent module (see voice/tts_server.py).

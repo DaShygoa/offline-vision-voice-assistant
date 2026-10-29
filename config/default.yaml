@@ -1,7 +1,7 @@
 app:
   camera_index: 0
-  width: 1280
-  height: 720
+  width: 1920
+  height: 1080
   ui_fps_target: 30
   locale: zh
   # no-microphone text command box (Tk IME window + in-frame bar)
@@ -9,18 +9,45 @@ app:
   text_input_always: false     # true = open IME window even with mic
 
 # ---------------------------------------------------------------------------
-# YOLO (optional ROI helper) — OpenVINO primary, OpenCV DNN fallback. NO CUDA.
+# Depth-guided zero-shot object localization (零样本物体定位)
+# Replaces YOLO's role in identify/remember: finds the nearest object via
+# monocular depth estimation — completely category-free.
+# References: DepSeg (arXiv 2512.05529), ZISVFM (arXiv 2502.03266)
+# Prep: python tools/prepare_models.py --depth
+# ---------------------------------------------------------------------------
+depth:
+  enabled: true
+  model_path: models/depth_anything_v2/depth_anything_v2_vits.onnx
+  input_size: 518               # DA-V2 Small native input
+  near_percentile: 80.0         # take nearest 20% of pixels as "object candidates"
+  min_area_frac: 0.005          # discard regions smaller than 0.5% of frame
+  max_area_frac: 0.60           # discard regions larger than 60% (likely background)
+  expand_ratio: 0.06            # expand bbox by 6% before cropping
+  show_depth_window: true       # open a separate depth heatmap window for demo
+  # CPU tuning: DA-V2 inference is ~600-850ms and runs on its own thread.
+  # Cap ONNX threads so it does not starve the UI/streaming threads.
+  onnx_threads: 4               # intra-op threads for DA-V2 (was: all cores)
+  refresh_interval_sec: 0.5     # target depth refresh period
+  min_idle_sec: 0.12            # guaranteed idle slice after each inference
+  # MobileSAM mask refinement: depth centroid → point prompt → pixel-precise mask
+  # Requires: python tools/prepare_models.py --mobilesam
+  use_mobilesam: true
+  encoder_path: models/mobile_sam/mobilesam_encoder.onnx
+  decoder_path: models/mobile_sam/mobilesam_decoder.onnx
+
+# ---------------------------------------------------------------------------
+# YOLO (optional ROI helper) — ONNX Runtime CPU / OpenCV DNN. NO OpenVINO, NO CUDA.
 # Only proposes crop boxes; identity always comes from ResNet18 retrieval.
+# When depth is enabled, YOLO is visualization-only (detection overlay).
 # ---------------------------------------------------------------------------
 yolo:
   enabled: true
-  backend: openvino            # openvino | opencv_dnn
-  model_path: models/yolov8n/yolov8n_openvino_model/yolov8n.xml   # OpenVINO IR preferred
-  onnx_path: models/yolov8n/yolov8n.onnx   # used by opencv_dnn / IR conversion fallback
-  device: GPU                  # GPU (Intel iGPU) | CPU — auto-fallback below
+  backend: onnxruntime        # onnxruntime | opencv_dnn  (OpenVINO removed)
+  model_path: models/yolov8n/yolov8n.onnx
+  onnx_path: models/yolov8n/yolov8n.onnx
+  device: cpu                  # CPU only
   allow_cpu_fallback: true
-  precision: FP16              # FP32 | FP16 | INT8  (INT8 requires a quantized .xml)
-  precision_int8_path: models/yolov8n/yolov8n_int8.xml
+  precision: FP32              # FP32 on CPU (no FP16 on CPU EP)
   conf_threshold: 0.40
   nms_threshold: 0.45
   input_size: 640
@@ -29,18 +56,18 @@ yolo:
 
 # ---------------------------------------------------------------------------
 # ResNet18 (ImageNet pretrained) — 选题一 feature extractor.
-# avgpool 512-d, L2-normalized, cosine retrieval. OpenVINO / ONNX Runtime.
+# avgpool 512-d, L2-normalized, cosine retrieval. ONNX Runtime CPU only.
 # Only runs on identify / remember / search — never camera hot path.
 # Prep: python tools/prepare_models.py --resnet18
 # ---------------------------------------------------------------------------
 resnet18:
   enabled: true
-  backend: openvino            # openvino | onnxruntime
-  model_path: models/resnet18/resnet18_openvino_model/resnet18.xml
+  backend: onnxruntime        # onnxruntime only (OpenVINO removed)
+  model_path: models/resnet18/resnet18.onnx
   onnx_path: models/resnet18/resnet18.onnx
-  device: GPU
+  device: cpu                  # CPU only
   allow_cpu_fallback: true
-  precision: FP16
+  precision: FP32              # FP32 on CPU (no FP16 on CPU EP)
   input_size: 224
   embed_dim: 512
 
@@ -65,10 +92,14 @@ memory:
   samples_dir: data/samples
   embeddings_path: data/resnet18_embeddings.npz
   match_threshold: 0.6769
+  # Centred features use a different scale; reject weak matches by default.
+  match_threshold_centered: 0.5
   topk: 3
   min_samples: 3
   max_samples: 10
   sample_duration_sec: 2.5
+  # Extend collection if CPU inference leaves fewer than min_samples; total limit.
+  sample_timeout_sec: 15.0
   sample_interval_ms: 250
   min_crop_px: 64
   # enrollment / identify uses central ROI when YOLO has no reliable box
@@ -88,7 +119,7 @@ asr:
   vad_model: models/silero_vad/silero_vad.onnx
   sample_rate: 16000
   num_threads: 4
-  max_end_silence_ms: 800
+  max_end_silence_ms: 2500     # wait 2.5s after last speech before finalizing (was 800ms, cut off mid-sentence)
   min_speech_ms: 250
   device: cpu
 
