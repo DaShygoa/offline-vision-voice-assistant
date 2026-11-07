@@ -21,14 +21,8 @@ _BG = (30, 30, 30)
 
 
 def _put_text(img, text, org, color, scale=0.55, thickness=1):
-    # Windows Chinese fonts
-    for font in ("Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "Arial"):
-        try:
-            (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-            # prefer native Chinese rendering via PIL-like fallback: cv2.putText cannot draw CJK
-        except Exception:
-            pass
-    # Use PIL if available for CJK, else OpenCV (may show ??? for Chinese)
+    # cv2.putText cannot render CJK glyphs. Prefer Pillow with a Windows Chinese
+    # font when available; otherwise fall back to OpenCV (Chinese may show as ???).
     try:
         from PIL import Image, ImageDraw, ImageFont
 

@@ -2,7 +2,12 @@
 
 > 基于 ResNet18 与语音交互的物体识别 Demo · 计算机视觉课程大作业选题一
 >
-> 本文说明**系统为什么这么设计**。使用说明见 [README.md](README.md)，实测数据见 [实测结论](#十实测结论)。
+> 本文说明**系统为什么这么设计**。使用说明见 [README.md](../README.md)，实测数据见 [实测结论](#十实测结论)。
+>
+> ⚠️ 本文部分章节记录的是早期方案（YOLO 提框 + OpenVINO 推理）。当前主链路已改为
+> **Depth Anything V2 零样本定位 + ONNX Runtime CPU**，并新增 Flask 浏览器界面。
+> 最新用法以 [README.md](../README.md) 为准，深度定位方案见
+> [零样本定位技术报告](zero_shot_depth_localization.md)。
 
 ---
 

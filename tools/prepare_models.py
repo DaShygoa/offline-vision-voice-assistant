@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 import urllib.request
 import zipfile
 
@@ -234,7 +235,6 @@ def prepare_mobilesam() -> str:
     # 2) export encoder + decoder ONNX via MobileSAM's export script (needs torch)
     print("[exp ] exporting MobileSAM encoder + decoder → ONNX (requires torch) …")
     try:
-        import sys
         import subprocess
         # try the standard MobileSAM export entrypoint if installed
         result = subprocess.run(
@@ -326,33 +326,34 @@ def prepare_asr() -> str:
     tokens = os.path.join(asr_dir, "tokens.txt")
     if os.path.isfile(tokens):
         print(f"[skip] {asr_dir}")
+        _prepare_vad()
         return asr_dir
 
-    archive = os.path.join(MODELS, "paraformer_zh.tar.bz2")
     try:
-        _download(SHERPA_PARAFORMER_INT8_URL, archive, "sherpa-onnx Paraformer zh")
-        tmp = os.path.join(MODELS, "_paraformer_extract")
-        _extract(archive, tmp)
-        # find extracted folder
-        found_root = None
-        for root, dirs, files in os.walk(tmp):
-            if "tokens.txt" in files:
-                found_root = root
-                break
-        if found_root:
-            import shutil
+        # The downloaded archive and extracted tree are build intermediates,
+        # not runtime models; do not leave a second copy of the weights behind.
+        with tempfile.TemporaryDirectory(prefix="vision_asr_prep_") as tmp:
+            archive = os.path.join(tmp, "paraformer_zh.tar.bz2")
+            extracted = os.path.join(tmp, "extracted")
+            _download(SHERPA_PARAFORMER_INT8_URL, archive, "sherpa-onnx Paraformer zh")
+            _extract(archive, extracted)
+            found_root = None
+            for root, dirs, files in os.walk(extracted):
+                if "tokens.txt" in files:
+                    found_root = root
+                    break
+            if found_root:
+                import shutil
 
-            for fn in os.listdir(found_root):
-                src = os.path.join(found_root, fn)
-                dst = os.path.join(asr_dir, fn)
-                if os.path.isfile(src):
-                    if os.path.abspath(src) != os.path.abspath(dst):
+                for fn in os.listdir(found_root):
+                    src = os.path.join(found_root, fn)
+                    dst = os.path.join(asr_dir, fn)
+                    if os.path.isfile(src):
                         shutil.copy2(src, dst)
-            # prefer int8 encoder/decoder names for config
-            _alias_int8(asr_dir)
-            print(f"[ok ] ASR models → {asr_dir}")
-        else:
-            print("[err] tokens.txt not found in archive")
+                _alias_int8(asr_dir, extracted)
+                print(f"[ok ] ASR models → {asr_dir}")
+            else:
+                print("[err] tokens.txt not found in archive")
     except Exception as e:
         print(f"[err] ASR download failed: {e}")
         print(f"      Manual: put tokens.txt / model.onnx / decoder.onnx under {asr_dir}")
@@ -360,7 +361,7 @@ def prepare_asr() -> str:
     return asr_dir
 
 
-def _alias_int8(asr_dir: str) -> None:
+def _alias_int8(asr_dir: str, extracted_dir: str | None = None) -> None:
     """Normalize names for config; e2e path only needs model.int8.onnx + tokens + am.mvn."""
     import shutil
 
@@ -389,7 +390,7 @@ def _alias_int8(asr_dir: str) -> None:
                     print(f"[ok ] asr sample → {dst}")
                 return
     # also check extract dir
-    for root, _, fs in os.walk(os.path.join(MODELS, "_paraformer_extract")):
+    for root, _, fs in os.walk(extracted_dir or ""):
         for fn in fs:
             if fn.endswith(".wav"):
                 src = os.path.join(root, fn)

@@ -74,8 +74,6 @@ def _run_batch_enroll(cfg: dict, name: str, images_dir: str) -> int:
         embeds = []
         saved = []
         for src in paths:
-            import cv2
-
             img = imread_unicode(src)
             if img is None:
                 print(f"[skip] unreadable: {src}")
@@ -110,7 +108,6 @@ def _run_batch_recognize(cfg: dict, image_path: str) -> int:
     if not os.path.isfile(image_path):
         print(f"[err] image not found: {image_path}", file=sys.stderr)
         return 2
-    import cv2
 
     img = imread_unicode(image_path)
     if img is None:

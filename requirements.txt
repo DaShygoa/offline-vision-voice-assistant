@@ -4,7 +4,11 @@
 # Vision
 opencv-python>=4.8
 numpy>=1.24,<3
-onnxruntime>=1.18.0          # primary inference backend for YOLO + ResNet18 (CPU)
+onnxruntime>=1.18.0          # inference backend for ResNet18 / Depth Anything V2 / MobileSAM (CPU)
+pillow>=10.0                 # CJK text in the OpenCV desktop UI (optional; falls back to cv2.putText)
+
+# Web UI (web/server.py)
+flask>=3.0
 
 # Voice
 sherpa-onnx>=1.10.50         # VAD (Silero) + optional sherpa Paraformer path
