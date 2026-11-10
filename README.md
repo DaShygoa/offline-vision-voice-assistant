@@ -9,20 +9,56 @@
 
 ![演示：浏览器界面](docs/screenshots/demo1.png)
 
-## 这个分支砍掉了什么
+## 项目架构
 
-相比 `master`，课堂展示版做了精简，只留一条稳定主链：
+分层设计：**编排层不含算法、算法层不感知界面**，因此 `vision/` 和 `voice/`
+可以脱离网页与摄像头独立测试（`tools/` 下的测试脚本正是这么做的）。
 
-| 已移除 | 原因 |
-| --- | --- |
-| YOLOv8n 检测器 | 深度定位已取代它成为候选区域来源；识别链路不再含类别先验 |
-| MobileSAM 及 `mobile_sam/` 包 | 掩码精化为可选增强，默认关闭，课堂不需要 |
-| 桌面 OpenCV 界面 / Tkinter 输入框 / `run.bat` `run.ps1` | 统一用更直观的浏览器界面 |
-| GPT-SoVITS 服务与 6 个环境维护脚本 | 改用 Edge TTS（在线、音色自然），断网自动降级提示音 |
-| A/B 评测、阈值标定、数据抓取、性能基准脚本 | 研发期工具，演示用不到 |
+```mermaid
+flowchart TB
+    subgraph UI["界面层"]
+        WEB["web/server.py · Flask<br/>MJPEG 视频流 · 深度热力图<br/>状态 / 对话 / 物体库 REST API"]
+    end
+    subgraph CORE["编排层"]
+        APP["core/app.py · AssistantApp<br/>组件装配 · 线程编排 · 意图分发 · 降级"]
+    end
+    subgraph ALGO["算法层"]
+        V["vision/<br/>深度定位 · ResNet18 特征<br/>余弦检索 · 裁剪 · 摄像头"]
+        A["voice/<br/>Silero VAD · Paraformer ASR<br/>Edge / mock TTS"]
+        N["nlu/<br/>中文规则意图解析"]
+    end
+    subgraph MEM["存储层"]
+        BANK["特征库<br/>SQLite 元数据 + NumPy 512 维矩阵"]
+    end
+    WEB -->|"inject_text / 资源开关"| APP
+    APP --> V
+    APP --> A
+    APP --> N
+    V --> BANK
+```
 
-保留：Flask 网页、深度定位、ResNet18 检索、中文语音输入（VAD + Paraformer）、
-规则 NLU、4 个回归测试 + 冒烟测试 + 深度定位测试、场景测试图与文档。
+| 层 | 职责 | 不做什么 |
+| --- | --- | --- |
+| `web/` | HTTP 服务、MJPEG 编码、页面渲染 | 不做识别、不做业务判断 |
+| `core/` | 线程编排、生命周期、组件装配、降级 | 不含视觉/语音算法、不画 GUI |
+| `vision/` `voice/` | 算法实现 | 不感知 Flask，不直接控制线程 |
+| `nlu/` | 文本 → 意图 | 不访问摄像头或特征库 |
+| `vision/memory.py` | 特征落盘与余弦检索 | 不做 UI、不做线程调度 |
+
+**线程模型**：`AssistantApp` 最多 4 个 daemon 线程，加上 Web 自带的渲染线程。
+
+| 线程 | 频率 | 职责 |
+| --- | --- | --- |
+| Flask 主线程 | 请求驱动 | 处理 REST，不跑推理 |
+| web-frames | ~30 FPS | 取最新帧、画框、JPEG 编码 |
+| camera | 尽可能快 | 覆盖式写最新帧缓冲（宁可丢帧也不积压延迟） |
+| depth | ~2 Hz | 低分辨率深度图供热力图 |
+| voice | VAD 端点触发 | mic → VAD → ASR → 意图队列 |
+| intent | 队列驱动 | 识别 / 录入 / 查找，真正跑 ResNet18 |
+
+**核心约束**：渲染路径只做「取最新帧 → 编码 JPEG」，从不等待推理；深度、ASR、
+ResNet18 都在按需触发的独立线程上，界面帧率与推理速度解耦。暂停识别时，总开关
+会一并释放摄像头、麦克风、深度推理与 MJPEG 编码这几个主要 CPU 消耗点。
 
 ## 快速开始（三条命令）
 
