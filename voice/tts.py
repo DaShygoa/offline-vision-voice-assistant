@@ -1,17 +1,15 @@
-"""TTS client — talks to an INDEPENDENT GPT-SoVITS server process.
+"""TTS client — classroom release (edge + mock).
 
-Design rule (spec §7 / deployment §7):
-  The vision / UI thread must NEVER wait for TTS.
-  call() is only invoked from a dedicated TTS worker thread.
-  If the server is down or slow, we degrade to mock/skip without blocking vision.
+Design rule: the vision / web thread must NEVER wait for TTS. Synthesis runs
+on a dedicated worker thread; if a backend fails we degrade to mock/skip
+without blocking recognition.
 
 Modes:
-  gpt_sovits : HTTP POST to local GPT-SoVITS-style server (voice/tts_server.py)
-  edge       : Microsoft Edge TTS (needs network; far lower latency than local CPU synth)
-  mock       : offline beep / silent (for tests without GPT-SoVITS installed)
+  edge  : Microsoft Edge TTS (natural Chinese voice; needs internet)
+  mock  : offline beep whose length tracks the reply (no network, for fallback)
 
-All modes go through the same TTS worker thread, so the vision hot path is
-unaffected regardless of which backend is active.
+On any edge error the client falls back to mock automatically, so a classroom
+with no internet still announces "something happened" without crashing.
 """
 
 from __future__ import annotations
@@ -19,11 +17,8 @@ from __future__ import annotations
 import logging
 import os
 import queue
-import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
 from typing import Optional
 
 import numpy as np
@@ -32,15 +27,9 @@ log = logging.getLogger(__name__)
 
 
 class TtsClient:
-    # The GPT-SoVITS server is a LOCAL process. If the shell has http_proxy set,
-    # urllib would tunnel 127.0.0.1 through it and fail with502 Bad Gateway.
-    # Always bypass proxies for loopback calls.
-    _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.mode = str(cfg.get("mode", "gpt_sovits")).lower()
-        self.server_url = str(cfg.get("server_url", "http://127.0.0.1:19880")).rstrip("/")
+        self.mode = str(cfg.get("mode", "edge")).lower()
         self.timeout = float(cfg.get("timeout_s", 20))
         self.play_audio = bool(cfg.get("play_audio", True))
         self.enabled = bool(cfg.get("enabled", True))
@@ -137,25 +126,28 @@ class TtsClient:
     def synthesize(self, text: str) -> Optional[str]:
         self.stats["requests"] += 1
         t0 = time.perf_counter()
+        path = None
         try:
             if self.mode == "mock":
                 path = self._mock_synth(text)
-            elif self.mode == "edge":
-                path = self._edge_synth(text)
-            else:
-                path = self._gpt_sovits_synth(text)
-            dt = (time.perf_counter() - t0) * 1000.0
-            audio_dur = self._wav_duration(path) if path else 0.0
-            if audio_dur > 0:
-                self.last_rtf = (dt / 1000.0) / audio_dur
-            n = self.stats["ok"]
-            self.stats["avg_synth_ms"] = (self.stats["avg_synth_ms"] * n + dt) / (n + 1)
-            self.stats["ok"] += 1
-            return path
+            else:  # edge (default) — fall back to mock on any failure
+                try:
+                    path = self._edge_synth(text)
+                except Exception as e:
+                    log.warning("edge TTS failed (%s); falling back to mock beep", e)
+                    path = self._mock_synth(text)
         except Exception as e:
             self.stats["fail"] += 1
             log.warning("synth error: %s", e)
             return None
+        dt = (time.perf_counter() - t0) * 1000.0
+        audio_dur = self._wav_duration(path) if path else 0.0
+        if audio_dur > 0:
+            self.last_rtf = (dt / 1000.0) / audio_dur
+        n = self.stats["ok"]
+        self.stats["avg_synth_ms"] = (self.stats["avg_synth_ms"] * n + dt) / (n + 1)
+        self.stats["ok"] += 1
+        return path
 
     # Available zh-CN voices (edge-tts 7.x, verified by list_voices() on this machine)
     EDGE_VOICES = (
@@ -220,48 +212,6 @@ class TtsClient:
             pass
         self._write_wav(wav, data.astype(np.float32), sr)
         return wav
-
-    def _gpt_sovits_synth(self, text: str) -> Optional[str]:
-        """POST {text} to local server; expects WAV bytes or JSON {\"path\": ...}."""
-        payload = {
-            "text": text,
-            "ref_audio": self.cfg.get("ref_audio", ""),
-            "prompt_text": self.cfg.get("prompt_text", self.cfg.get("ref_text", "")),
-            "prompt_lang": self.cfg.get("prompt_lang", "zh"),
-            "text_lang": "zh",
-        }
-        import json
-
-        req = urllib.request.Request(
-            f"{self.server_url}/tts",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with TtsClient._OPENER.open(req, timeout=self.timeout) as resp:
-                data = resp.read()
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise RuntimeError(f"GPT-SoVITS server unreachable at {self.server_url}: {e}") from e
-
-        content_type = resp.headers.get("Content-Type", "") if hasattr(resp, "headers") else ""
-        out = os.path.join(tempfile.gettempdir(), f"tts_out_{int(time.time()*1000)}.wav")
-        if "application/json" in content_type:
-            meta = json.loads(data.decode("utf-8"))
-            src = meta.get("path") or meta.get("audio")
-            if src and os.path.isfile(src):
-                return src
-            if src and str(src).startswith("data:"):
-                import base64
-
-                b64 = str(src).split(",", 1)[-1]
-                with open(out, "wb") as f:
-                    f.write(base64.b64decode(b64))
-                return out
-            raise RuntimeError(f"Bad TTS JSON response: {meta}")
-        with open(out, "wb") as f:
-            f.write(data)
-        return out
 
     def _ensure_mock_wav(self) -> None:
         path = self.cfg.get("mock_wav", "data/tts_beep.wav")
@@ -346,17 +296,10 @@ class TtsClient:
             return "disabled"
         if self.mode == "mock":
             return "mock"
-        if self.mode == "edge":
-            # No local process to probe; report whether the SDK is importable.
-            try:
-                import edge_tts  # noqa: F401
-
-                return "ok:edge"
-            except Exception as e:
-                return f"down:{type(e).__name__}"
+        # edge — no local process to probe; report whether the SDK is importable.
         try:
-            req = urllib.request.Request(f"{self.server_url}/health", method="GET")
-            with TtsClient._OPENER.open(req, timeout=1.5) as resp:
-                return f"ok:{resp.status}"
-        except Exception:
-            return "down"
+            import edge_tts  # noqa: F401
+
+            return "ok:edge"
+        except Exception as e:
+            return f"down:{type(e).__name__}"

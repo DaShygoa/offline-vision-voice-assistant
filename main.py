@@ -1,19 +1,14 @@
 #!/usr/bin/env python
-"""Entry point — ResNet18 + 语音交互物体识别 Demo (选题一).
+"""Batch entry point — enroll / recognize local images (classroom release).
 
-Usage:
-    python main.py                              # full UI + voice
-    python main.py --no-voice                   # UI + text/keyboard commands
-    python main.py --headless                   # no OpenCV window (for CI smoke)
-    python main.py --camera 0 --config config/default.yaml
+The live camera demo runs through the Web UI:
 
-Batch (no camera / no UI):
-    python main.py --enroll 水杯 --images data/enroll/cup      # 录入：名称 + 图片目录
-    python main.py --recognize data/query/test.png             # 识别：单张本地图片
+    python web/server.py            # then open http://127.0.0.1:5000
 
-Windows (recommended — uses vision_ai conda env):
-    run.bat --camera 2 --no-voice
-    .\run.ps1 --camera 2 --no-voice
+Batch mode (no camera, no UI, no microphone):
+
+    python main.py --enroll 水杯 --images data/enroll/cup
+    python main.py --recognize data/query/test.png
 """
 
 from __future__ import annotations
@@ -142,18 +137,9 @@ def _run_batch_recognize(cfg: dict, image_path: str) -> int:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
-        description="ResNet18 + 语音交互物体识别 Demo (选题一, CPU only, no CUDA/OpenVINO)"
+        description="ResNet18 批量录入 / 识别（课堂展示版；实时演示请用 python web/server.py）"
     )
-    p.add_argument("--config", default=None, help="path to YAML config")
-    p.add_argument("--camera", type=int, default=None, help="camera index")
-    p.add_argument("--no-voice", action="store_true", help="disable mic/ASR (keyboard/text input)")
-    p.add_argument("--text-input", action="store_true", help="force text input window (IME) even with mic")
-    p.add_argument("--headless", action="store_true", help="no GUI window")
-    p.add_argument("--yolo-device", choices=["GPU", "CPU"], default=None)
-    p.add_argument("--resnet-device", choices=["GPU", "CPU"], default=None)
-    p.add_argument("--precision", choices=["FP32", "FP16", "INT8"], default=None)
-    p.add_argument("--tts-mode", choices=["edge", "gpt_sovits", "mock"], default=None,
-                   help="TTS 引擎：edge=微软在线(快,需联网) / gpt_sovits=本地离线(慢) / mock=测试")
+    p.add_argument("--config", default=None, help="path to YAML config (default: config/demo.yaml)")
     p.add_argument(
         "--enroll",
         default=None,
@@ -170,7 +156,6 @@ def main(argv=None) -> int:
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
-    # project root on sys.path
     root = os.path.dirname(os.path.abspath(__file__))
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -178,52 +163,19 @@ def main(argv=None) -> int:
 
     _setup_logging(args.verbose)
 
-    # wrong env → confusing "No module named onnxruntime"
     missing = []
-    for mod in ("cv2", "yaml"):
+    for mod in ("cv2", "yaml", "onnxruntime"):
         try:
             __import__(mod)
         except ImportError:
             missing.append(mod)
-    try:
-        __import__("onnxruntime")
-    except ImportError:
-        missing.append("onnxruntime")
     if missing:
-        py = sys.executable
-        if "vision_ai" not in py.replace("\\", "/"):
-            print(
-                f"[env] 缺少依赖: {', '.join(missing)}\n"
-                f"      当前: {py}\n"
-                f"      请切换环境后重试:\n"
-                f"        conda activate vision_ai\n"
-                f"        python main.py --camera {args.camera or 0}",
-                file=sys.stderr,
-            )
-        else:
-            print(f"[env] vision_ai 中仍缺少: {', '.join(missing)}", file=sys.stderr)
+        print(f"[env] 缺少依赖: {', '.join(missing)}；请先 pip install -r requirements.txt", file=sys.stderr)
 
     from core.config import load_config
 
-    overrides = {}
-    if args.camera is not None:
-        overrides.setdefault("app", {})["camera_index"] = args.camera
-    if args.yolo_device:
-        overrides.setdefault("yolo", {})["device"] = args.yolo_device
-    if args.resnet_device:
-        overrides.setdefault("resnet18", {})["device"] = args.resnet_device
-    if args.precision:
-        overrides.setdefault("yolo", {})["precision"] = args.precision
-        overrides.setdefault("resnet18", {})["precision"] = args.precision
-    if args.tts_mode:
-        overrides.setdefault("tts", {})["mode"] = args.tts_mode
-    if args.text_input:
-        overrides.setdefault("app", {})["text_input"] = True
-        overrides.setdefault("app", {})["text_input_always"] = True
+    cfg = load_config(args.config, None)
 
-    cfg = load_config(args.config, overrides or None)
-
-    # ---- batch modes (no camera / no voice / no UI) ----
     if args.enroll:
         if not args.images:
             print("[err] --enroll requires --images DIR", file=sys.stderr)
@@ -232,16 +184,8 @@ def main(argv=None) -> int:
     if args.recognize:
         return _run_batch_recognize(cfg, args.recognize)
 
-    from core.app import AssistantApp
-
-    app = AssistantApp(cfg, headless=args.headless, use_voice=not args.no_voice)
-    try:
-        app.start()
-        app.run_ui()
-    except KeyboardInterrupt:
-        print("\ninterrupted")
-    finally:
-        app.stop()
+    p.print_help()
+    print("\n实时摄像头演示请运行: python web/server.py")
     return 0
 
 

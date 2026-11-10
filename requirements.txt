@@ -1,33 +1,28 @@
-# Offline vision + voice assistant — target: Windows, CPU only (NO CUDA, NO OpenVINO)
+# Classroom release — offline vision + voice assistant
+# Target: Windows, CPU only (NO CUDA, NO OpenVINO, NO PyTorch at runtime)
 # Python 3.10 / 3.11
 
-# Vision
+# Vision (ONNX Runtime CPU: ResNet18 features + Depth Anything V2 localization)
 opencv-python>=4.8
 numpy>=1.24,<3
-onnxruntime>=1.18.0          # inference backend for ResNet18 / Depth Anything V2 / MobileSAM (CPU)
-pillow>=10.0                 # CJK text in the OpenCV desktop UI (optional; falls back to cv2.putText)
+onnxruntime>=1.18.0
 
-# Web UI (web/server.py)
+# Web UI (Flask + MJPEG streaming)
 flask>=3.0
 
-# Voice
-sherpa-onnx>=1.10.50         # VAD (Silero) + optional sherpa Paraformer path
-kaldi-native-fbank>=1.10.40  # Paraformer e2e feature pipeline (LFR+CMVN)
+# Voice input (Silero VAD + Paraformer INT8 ASR) and output
+sherpa-onnx>=1.10.50
+kaldi-native-fbank>=1.10.40  # Paraformer e2e feature pipeline (LFR + CMVN)
 sounddevice>=0.4.6
 soundfile>=0.12.1
-librosa>=0.10.0              # optional: only for tooling/tests
-edge-tts>=7.0                # default TTS engine (config tts.mode=edge). Needs network.
+edge-tts>=7.0                # default TTS; auto-falls back to mock beep when offline
 
-# System / benchmark
-psutil>=5.9
+# Config
 pyyaml>=6.0
-tqdm>=4.66
 
-# NOTE: PyTorch is NOT required at runtime.
-# GPT-SoVITS runs as an independent module (see voice/tts_server.py).
-#
-# TTS engines (config: tts.mode)
-#   edge      -> edge-tts only. Low latency (~1.8s incl. network), needs internet.
-#   gpt_sovits-> fully offline, but CPU RTF ~1.3 (slower). Separate process + torch env.
-#   mock      -> no audio, for tests.
-# Any audio played on this machine must be the user's own or a properly licensed voice.
+# Notes
+#   Model preparation (tools/prepare_models.py) needs torch/torchvision ONCE to
+#   export ResNet18; that dependency is NOT required to run the app.
+#   Runtime inference, ASR and NLU are fully offline. Only Edge TTS needs
+#   internet; without it the assistant degrades to a local mock beep.
+#   Any audio played in class must be appropriately licensed.

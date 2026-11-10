@@ -78,9 +78,6 @@ class DepthEstimator:
         self.max_area_frac = float(cfg.get("max_area_frac", 0.45))
         self.expand_ratio = float(cfg.get("expand_ratio", 0.06))
         self.model_path = cfg.get("model_path", "models/depth_anything_v2/depth_anything_v2_vits.onnx")
-        # optional MobileSAM mask refinement (pixel-precise bbox instead of rectangular)
-        self.use_mobilesam = bool(cfg.get("use_mobilesam", False))
-        self._sam_refiner = None
         self.ready = False
         self.device_used = "none"
         self._sess = None
@@ -130,18 +127,6 @@ class DepthEstimator:
 
         self.ready = True
         log.info("Depth Anything V2 loaded (%s, threads=%d)", self.model_path, n_threads)
-
-        # optional MobileSAM refinement
-        if self.use_mobilesam:
-            try:
-                from .mobilesam import MobileSAMRefiner
-                self._sam_refiner = MobileSAMRefiner(self.cfg)
-                self._sam_refiner.load()
-                log.info("MobileSAM refinement enabled (%s)", self._sam_refiner.device_used)
-            except Exception as e:
-                log.warning("MobileSAM load failed (depth bbox used as-is): %s", e)
-                self._sam_refiner = None
-                self.use_mobilesam = False
 
     # ------------------------------------------------------------- infer
     def estimate_depth(self, frame_bgr: np.ndarray, fast: bool = False) -> Optional[np.ndarray]:
@@ -495,23 +480,13 @@ class DepthEstimator:
             return crop
 
     def crop_nearest(self, frame_bgr: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int], DepthRegion]]:
-        """Full pipeline: depth → nearest object → [MobileSAM refine] → mask-clean crop.
+        """Full pipeline: depth → nearest object → mask-clean crop.
 
         Returns (crop, box, region) or None.
         """
         region = self.find_nearest_object(frame_bgr)
         if region is None:
             return None
-
-        # MobileSAM refinement
-        if self._sam_refiner is not None and self._sam_refiner.ready:
-            try:
-                mask_result = self._sam_refiner.refine_region(frame_bgr, region.box)
-                if mask_result is not None:
-                    region.box = mask_result.box
-                    region.mask = mask_result.mask
-            except Exception as e:
-                log.debug("MobileSAM refine failed: %s", e)
 
         r = self.crop_region(frame_bgr, region)
         if r is None:

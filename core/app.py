@@ -1,19 +1,20 @@
-"""Main application orchestrator (选题一: ResNet18 + 语音交互物体识别).
+"""Main application orchestrator — classroom release (Web UI only).
 
 Threading model:
-  ┌ main thread      : OpenCV camera UI loop @ 25–30 FPS (never blocks on TTS/ASR/embed)
-  ├ camera thread    : frame capture → latest() buffer
-  ├ detect thread    : YOLO every N frames (optional ROI helper), updates shared detections
-  ├ voice thread     : mic → VAD → ASR → intent → queue
-  ├ intent worker    : identify / remember / search via ResNet18 + cosine feature bank
-  └ tts worker       : GPT-SoVITS independent client (async; UI does not wait)
+  ├ camera thread    : frame capture → latest() buffer (overwrite, no queue)
+  ├ depth thread     : Depth Anything V2 heatmap @ ~2 Hz (paused on demand)
+  ├ voice thread     : mic → VAD → Paraformer ASR → intent queue
+  ├ intent worker    : identify / remember / search (ResNet18 + cosine bank)
+  └ tts worker       : edge / mock synthesis (async; never blocks the worker)
 
-Core flow (assignment):
-  enroll   : crop → ResNet18 512-d → save name + features to feature bank
-  identify : crop → ResNet18 → cosine vs bank → score >= threshold ? name : 未知物体
-  voice    : ASR says the object name / TTS announces the recognition result
+The web layer (web/server.py) owns its own frame-encoding thread; AssistantApp
+itself owns no GUI. All heavy inference runs off the Flask request path.
 
-ResNet18 only runs on identify / remember / search — never in the camera hot path.
+Core flow:
+  locate   : depth nearest object → top-k regions → filters → crop
+  identify : crop → ResNet18 512-d → centred cosine → name / 不太确定 / 未知
+  remember : same crop pipeline → multi-view samples → SQLite + NumPy bank
+  voice    : ASR text → rule NLU → intent queue → TTS announces the result
 """
 
 from __future__ import annotations
@@ -34,14 +35,12 @@ from core.debug_capture import DebugCapture
 from nlu.intent import Intent, IntentType, parse_intent
 from vision.camera import Camera
 from vision.depth import DepthEstimator
-from vision.detector import Detection, YoloDetector
 from vision.feature_extractor import ResNet18Extractor
 from vision.image_io import imread_unicode, imwrite_unicode
 from vision.memory import MemoryMatch, VisualMemory
 from vision.object_cropper import ObjectCropper
 from vision.position import describe_position
-from vision.visualizer import OverlayState, Visualizer
-from ui.text_input import TextInputWindow
+from vision.visualizer import OverlayState
 from voice.asr import ParaformerASR
 from voice.mic import MicStream
 from voice.tts import TtsClient
@@ -79,7 +78,6 @@ class AssistantApp:
 
         self.stats = AppStats()
         self._overlay = OverlayState()
-        self._viz = Visualizer(center_roi_frac=float(cfg.get("memory", {}).get("center_roi_frac", 0.45)))
 
         # components
         self.camera = Camera(
@@ -87,8 +85,6 @@ class AssistantApp:
             width=int(cfg.get("app", {}).get("width", 1920)),
             height=int(cfg.get("app", {}).get("height", 1080)),
         )
-        self.yolo_enabled = bool(cfg.get("yolo", {}).get("enabled", True))
-        self.detector = YoloDetector(cfg.get("yolo", {})) if self.yolo_enabled else None
         self.resnet = ResNet18Extractor(cfg.get("resnet18", {}))
         self.memory = VisualMemory(cfg.get("memory", {}))
         self.cropper = ObjectCropper(
@@ -112,7 +108,6 @@ class AssistantApp:
             log.warning("Face rejection unavailable: %s", e)
         self.depth_enabled = bool(depth_cfg.get("enabled", False))
         self.depth_est = DepthEstimator(depth_cfg) if self.depth_enabled else None
-        self._show_depth_window = bool(depth_cfg.get("show_depth_window", False)) and not headless
         self._depth_heatmap: Optional[np.ndarray] = None
         self._depth_box: Optional[tuple] = None
         self._depth_lock = threading.Lock()
@@ -142,13 +137,6 @@ class AssistantApp:
         self.asr = ParaformerASR(cfg.get("asr", {}))
         self.mic = MicStream(sample_rate=int(cfg.get("asr", {}).get("sample_rate", 16000)))
 
-        self._det_every = max(1, int(cfg.get("yolo", {}).get("every_n_frames", 4)))
-        self._detections: List[Detection] = []
-        self._det_lock = threading.Lock()
-        self._det_frame_id = -1
-        self._det_count = 0
-        self._det_fps_t0 = time.time()
-
         self._intent_q: "queue.Queue[Intent]" = queue.Queue(maxsize=8)
         self._running = False
         self._threads: List[threading.Thread] = []
@@ -159,50 +147,22 @@ class AssistantApp:
         self._mic_muted_until = 0.0  # avoid hearing our own TTS (simple half-duplex)
         self._flash_until = 0.0
 
-        # text command input (no-microphone fallback)
-        app_cfg = cfg.get("app", {})
+        # debug capture (optional; off by default in the classroom config)
         dbg_cfg = cfg.get("debug", {})
         self.debug_cap = DebugCapture(
-            enabled=bool(dbg_cfg.get("enabled", True)),
+            enabled=bool(dbg_cfg.get("enabled", False)),
             base_dir=dbg_cfg.get("dir", "data/debug"),
         )
-        self._text_input_enabled = bool(app_cfg.get("text_input", True)) and not headless
-        self._text_input_always = bool(app_cfg.get("text_input_always", False))
-        self.text_input: Optional[TextInputWindow] = None
-        self._cv_input_focused = False
-        self._cv_input_buf = ""
-        self._cv_input_placeholder = "输入指令… (t/Enter 聚焦，回车发送，Esc 取消)"
-        self._need_text_input = False
-
-    def _ensure_text_input(self) -> None:
-        """Open the Tk IME window once (idempotent). Call from UI/main thread."""
-        if not self._text_input_enabled or self.headless:
-            return
-        if self.text_input is not None and self.text_input.available:
-            return
-        win = TextInputWindow(on_submit=self.inject_text)
-        if win.start():
-            self.text_input = win
-        else:
-            log.info("Falling back to in-frame OpenCV text input (press t)")
-        self._need_text_input = False
 
     # ----------------------------------------------------------------- boot
     def start(self) -> None:
         log.info("Loading models …")
-        if self.detector is not None:
-            try:
-                self.detector.load()
-            except Exception as e:
-                log.warning("YOLO load failed (ROI falls back to center crop): %s", e)
-                self.detector = None
-                self.yolo_enabled = False
         if self.depth_est is not None:
             try:
                 self.depth_est.load()
                 log.info("Depth estimator ready (%s)", self.depth_est.device_used)
             except Exception as e:
-                log.warning("Depth estimator load failed (falls back to YOLO/center): %s", e)
+                log.warning("Depth estimator load failed (falls back to center ROI): %s", e)
                 self.depth_est = None
                 self.depth_enabled = False
         try:
@@ -236,20 +196,13 @@ class AssistantApp:
         if not self._mic_enabled:
             log.info("Microphone left closed (--no-mic); enable it from the web UI")
             self.stats.mic_enabled = False
-
-        # text box: always if no mic, or if user asked for it
-        if self._text_input_enabled and (self._text_input_always or not self.use_voice):
-            self._ensure_text_input()
-            self._overlay.input_visible = True
-        elif self._text_input_enabled:
-            self._overlay.input_visible = True
+        if not self.use_voice:
+            self.stats.last_reply = "未检测到麦克风或语音模型，可使用网页文字输入发送指令。"
 
         self._running = True
         self._threads = [
             threading.Thread(target=self._intent_loop, name="intent", daemon=True),
         ]
-        if self.yolo_enabled and self.detector is not None:
-            self._threads.insert(0, threading.Thread(target=self._detect_loop, name="detect", daemon=True))
         if self.depth_enabled and self.depth_est is not None:
             self._threads.append(threading.Thread(target=self._depth_loop, name="depth", daemon=True))
         if self.use_voice and self._mic_enabled:
@@ -262,77 +215,30 @@ class AssistantApp:
         self.stats.tts_health = self.tts.health()
         self._refresh_mem_info()
         log.info(
-            "Started. memory=%s yolo=%s resnet18=%s tts=%s voice=%s text_input=%s",
+            "Started. memory=%s depth=%s resnet18=%s tts=%s voice=%s",
             st,
-            self.detector.device_used if self.detector else "off",
+            self.depth_est.device_used if self.depth_est else "off",
             self.resnet.device_used,
             self.stats.tts_health,
             self.use_voice,
-            "ime" if self.text_input else ("frame" if self._text_input_enabled else "off"),
         )
-        if not self.use_voice:
-            self.say("未检测到麦克风，可使用文本输入框发送指令。")
-        else:
-            self.say("物体识别助手已启动。")
+        self.say("物体识别助手已启动。")
 
     def stop(self) -> None:
         self._running = False
         for t in self._threads:
             t.join(timeout=2.0)
-        if self.text_input is not None:
-            self.text_input.stop()
-            self.text_input = None
         self.camera.stop()
         self.tts.stop()
         if self.use_voice:
             self.mic.stop()
         self.memory.close()
 
-    # ------------------------------------------------------------ detect
-    def _detect_loop(self) -> None:
-        while self._running:
-            frame, fid = self.camera.latest()
-            if frame is None or fid == self._det_frame_id:
-                time.sleep(0.005)
-                continue
-            if fid % self._det_every != 0:
-                time.sleep(0.002)
-                continue
-            self._det_frame_id = fid
-            try:
-                dets, dt = self.detector.infer(frame)
-            except Exception as e:
-                log.warning("detect error: %s", e)
-                time.sleep(0.05)
-                continue
-            with self._det_lock:
-                self._detections = dets
-            self.stats.det_latency_ms = dt
-            self._det_count += 1
-            now = time.time()
-            if now - self._det_fps_t0 >= 1.0:
-                self.stats.det_fps = self._det_count / (now - self._det_fps_t0)
-                self._det_count = 0
-                self._det_fps_t0 = now
-            if dets:
-                top = dets[0]
-                self.stats.det_info = (
-                    f"YOLO {self.detector.device_used} | {top.label}:{top.conf:.2f} "
-                    f"(+{len(dets)-1}) @{dt:.0f}ms"
-                )
-            else:
-                self.stats.det_info = f"YOLO {self.detector.device_used} | none @{dt:.0f}ms"
-
-    def _current_detections(self) -> List[Detection]:
-        with self._det_lock:
-            return list(self._detections)
-
     # ------------------------------------------------------------- voice
     def _voice_loop(self) -> None:
         if not self.mic.start():
-            log.warning("Mic unavailable — voice disabled, enable text input")
+            log.warning("Mic unavailable — voice disabled, use the web text input")
             self.use_voice = False
-            self._need_text_input = True  # opened on UI thread
             return
         buf: List[np.ndarray] = []
         speaking = False
@@ -741,71 +647,12 @@ class AssistantApp:
                                      top_matches=top_list,
                                      is_best=is_better)
 
-                # Refine the winning candidate with MobileSAM (once — the encoder
-                # is ~1s, so refining every candidate would cost 4s+).
-                if best_region is not None and self.depth_est._sam_refiner is not None:
-                    try:
-                        mr = self.depth_est._sam_refiner.refine_region(
-                            frame, best_region.box, depth=depth, mask=best_region.mask)
-                        dc.add_stage("mobilesam_refined",
-                                     found=mr is not None,
-                                     box=list(mr.box) if mr else None,
-                                     score=round(mr.score, 3) if mr else None)
-                        if mr is not None:
-                            best_region.box = mr.box
-                            best_region.mask = mr.mask
-                            r2 = self.depth_est.crop_region(frame, best_region)
-                            if r2 is not None:
-                                crop2, box2 = r2
-                                if self.cropper.quality_ok(crop2):
-                                    mask2 = (best_region.mask[box2[1]:box2[3], box2[0]:box2[2]]
-                                             if best_region.mask is not None else None)
-                                    emb2, m2 = self._match_crop(crop2, mask2)
-                                    if emb2 is not None:
-                                        is_better = bool(m2 and (best is None or m2.score > best.score))
-                                        if is_better:
-                                            best, best_box = m2, box2
-                                            best_emb = emb2
-                                            best_idx = len(cand_boxes)
-                                        dc.add_candidate(crop2, box2, best_region.score,
-                                                         best_region.area_frac, "mobilesam",
-                                                         mask=best_region.mask,
-                                                         match_name=m2.user_name if m2 else "",
-                                                         match_score=m2.score if m2 else 0.0,
-                                                         is_best=is_better)
-                                        cand_boxes.append(box2)
-                                        cand_labels.append(f"SAM:{m2.user_name if m2 else '?'}")
-                    except Exception as e:
-                        log.warning("MobileSAM refine skipped: %s", e)
-                        dc.add_stage("mobilesam_error", error=str(e))
-
                 if best is not None and best_box is not None:
                     self._update_depth_vis(frame, best_box)
                 elif regions:
                     self._update_depth_vis(frame, regions[0].box)
 
-        # 2) YOLO boxes fallback (visualization-only when depth is active)
-        if best is None:
-            dets = self._current_detections()
-            for crop, box, det in self.cropper.crop_detections(frame, dets):
-                if not self.cropper.quality_ok(crop):
-                    continue
-                emb, m = self._match_crop(crop)
-                if emb is None:
-                    continue
-                cand_boxes.append(box)
-                cand_labels.append(f"yolo:{det.label}")
-                is_better = bool(m and (best is None or m.score > best.score))
-                if is_better:
-                    best, best_box = m, box
-                    best_emb = emb
-                    best_idx = len(cand_boxes) - 1
-                dc.add_candidate(crop, box, 0.0, 0.0, f"yolo:{det.label}",
-                                 match_name=m.user_name if m else "",
-                                 match_score=m.score if m else 0.0,
-                                 is_best=is_better)
-
-        # 3) center ROI fallback (last resort) — ONLY when depth was unavailable.
+        # 2) center ROI fallback (last resort) — ONLY when depth was unavailable.
         # If depth ran and every candidate was rejected (face / too_far / quality),
         # the scene has no showable object; falling through to the centre ROI would
         # crop whatever sits mid-frame (often the speaker's own face) and falsely
@@ -991,8 +838,10 @@ class AssistantApp:
                         time.sleep(0.02)
                         continue
                 if crop is None or crop.size == 0:
-                    dets = self._current_detections()
-                    crop, box, source = self.cropper.crop_for_learning(frame, dets, generic_class=None)
+                    # Depth unavailable → center ROI fallback (never YOLO).
+                    box = self.cropper.center_roi(frame)
+                    crop = self.cropper.crop_box(frame, box)
+                    source = "center_roi"
                 if not self.cropper.quality_ok(crop):
                     quality_rejected += 1
                     time.sleep(0.02)
@@ -1008,11 +857,6 @@ class AssistantApp:
                     if max(sims) > 0.995:
                         time.sleep(0.02)
                         continue
-                if source == "yolo" and not generic_guess:
-                    dets_now = self._current_detections()
-                    best_det = self.cropper.best_center_detection(dets_now, frame)
-                    if best_det is not None:
-                        generic_guess = best_det.label
                 embeds.append(emb)
                 samples.append((crop, box, source))
                 self._overlay.learning_progress = min(0.99, len(samples) / min_samples)
@@ -1068,50 +912,32 @@ class AssistantApp:
             return "你要找什么？请说：帮我找……"
         if not getattr(self.resnet, "ready", False):
             return "ResNet18 未加载，无法检索。"
-        if self.memory.stats()["objects"] == 0 and not self._current_detections():
-            return f"特征库还是空的，画面里也暂未检测到{label}。可先：记住，这个叫……"
+        if self.memory.stats()["objects"] == 0:
+            return f"特征库还是空的，可先：记住，这个叫……"
 
         frame, _ = self.camera.latest()
         if frame is None:
             return "摄像头还没有画面。"
         h, w = frame.shape[:2]
         obj = self.memory.find_by_name(label)
-        dets = self._current_detections()
 
         best_box = None
         best_score = -1.0
         best_mem: Optional[MemoryMatch] = None
 
-        if dets:
-            for crop, box, det in self.cropper.crop_detections(frame, dets):
-                if not self.cropper.quality_ok(crop):
-                    continue
-                emb = self._embed_crop(crop)
-                if emb is None:
-                    continue
+        box = self.cropper.center_roi(frame)
+        crop = self.cropper.crop_box(frame, box)
+        if self.cropper.quality_ok(crop):
+            emb = self._embed_crop(crop)
+            if emb is not None:
                 m = self.memory.best_match(emb)
-                if m is None:
-                    continue
-                if _name_related(label, m.user_name) or (obj and m.object_id == obj.object_id):
-                    if m.score > best_score:
-                        best_score = m.score
-                        best_box = box
-                        best_mem = m
-
-        if best_box is None:
-            box = self.cropper.center_roi(frame)
-            crop = self.cropper.crop_box(frame, box)
-            if self.cropper.quality_ok(crop):
-                emb = self._embed_crop(crop)
-                if emb is not None:
-                    m = self.memory.best_match(emb)
-                    if m and (
-                        _name_related(label, m.user_name)
-                        or (obj and m.object_id == obj.object_id)
-                    ):
-                        best_box = box
-                        best_score = m.score
-                        best_mem = m
+                if m and (
+                    _name_related(label, m.user_name)
+                    or (obj and m.object_id == obj.object_id)
+                ):
+                    best_box = box
+                    best_score = m.score
+                    best_mem = m
 
         if best_box is None:
             if self.memory.stats()["objects"] == 0:
@@ -1342,224 +1168,6 @@ class AssistantApp:
         with self._depth_lock:
             self._depth_heatmap = DepthEstimator.depth_to_colormap(depth)
             self._depth_box = box
-
-    def _render_depth_window(self) -> None:
-        """Display cached depth heatmap in a separate window. Never runs inference."""
-        with self._depth_lock:
-            heatmap = self._depth_heatmap
-            box = self._depth_box
-        if heatmap is None:
-            return
-        # resize to display size FIRST, then draw text (avoids blur)
-        dw, dh = 640, 360
-        h, w = heatmap.shape[:2]
-        if (w, h) != (dw, dh):
-            sx, sy = dw / w, dh / h
-            display = cv2.resize(heatmap, (dw, dh), interpolation=cv2.INTER_AREA)
-        else:
-            sx, sy = 1.0, 1.0
-            display = heatmap.copy()
-        if box is not None:
-            x1, y1, x2, y2 = box
-            x1, x2 = int(x1 * sx), int(x2 * sx)
-            y1, y2 = int(y1 * sy), int(y2 * sy)
-            cv2.rectangle(display, (x1, y1), (x2, y2), (255, 255, 255), 2)
-            cv2.putText(display, "nearest object", (x1, max(20, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(display, "warm=near  cool=far", (10, 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.imshow("Depth (zero-shot localization)", display)
-
-    # ---------------------------------------------------------------- ui
-    def run_ui(self) -> None:
-        win = "Object Recognition Demo (ResNet18)"
-        depth_win = "Depth (zero-shot localization)"
-        if not self.headless:
-            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(win, 960, 540)
-            cv2.moveWindow(win, 40, 60)
-            if self._show_depth_window:
-                cv2.namedWindow(depth_win, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(depth_win, 640, 360)
-                cv2.moveWindow(depth_win, 1020, 160)
-        ui_target = float(self.cfg.get("app", {}).get("ui_fps_target", 30))
-        frame_dt = 1.0 / max(1.0, ui_target)
-        fps_ema = 0.0
-        last_ui = time.time()
-
-        try:
-            while self._running:
-                t0 = time.perf_counter()
-                if self._need_text_input:
-                    if not getattr(self, "_text_fix_announced", False):
-                        self._ensure_text_input()
-                        self._text_fix_announced = True
-                        if not self.use_voice:
-                            self.stats.last_reply = "未检测到麦克风，请使用文本输入框发送指令"
-                frame, _ = self.camera.latest()
-                if frame is None:
-                    time.sleep(0.01)
-                    continue
-
-                if time.time() > self._flash_until:
-                    self._overlay.highlight = []
-                    self._overlay.match_box = None
-
-                self._overlay.detections = self._current_detections()
-                self._overlay.fps = fps_ema
-                self._overlay.status_line = (
-                    self.stats.last_reply
-                    or "就绪 — 说“这是什么？” / 按 O 识别本地图片 / 按 L 查看列表"
-                )
-                self._overlay.det_info = self.stats.det_info
-                if not self.stats.mem_info:
-                    self._refresh_mem_info()
-                self._overlay.mem_info = self.stats.mem_info
-                self._overlay.subtitle = (
-                    self._last_subtitle if time.time() < self._subtitle_until else ""
-                )
-
-                self._overlay.input_visible = self._text_input_enabled
-                if self.text_input is not None and self.text_input.available:
-                    live = self.text_input.display_text
-                    self._overlay.input_text = live
-                    self._overlay.input_focused = self.text_input.is_typing
-                    if not live:
-                        self._overlay.input_placeholder = (
-                            "在文本窗输入中文并回车（无麦克风）"
-                            if not self.use_voice
-                            else "输入指令… 或用语音"
-                        )
-                else:
-                    self._overlay.input_text = self._cv_input_buf
-                    self._overlay.input_focused = self._cv_input_focused
-                    self._overlay.input_placeholder = self._cv_input_placeholder
-
-                # resize frame to display size FIRST, then draw overlays on it
-                # (avoids blur from cv2.resizeWindow downscaling rendered text)
-                display_w, display_h = 960, 540
-                fh, fw = frame.shape[:2]
-                if (fw, fh) != (display_w, display_h):
-                    frame = cv2.resize(frame, (display_w, display_h), interpolation=cv2.INTER_AREA)
-
-                vis = self._viz.draw(frame, self._overlay)
-
-                if not self.headless:
-                    cv2.imshow(win, vis)
-                    # depth heatmap window (zero-shot localization demo) — reads cache only
-                    if self._show_depth_window and self.depth_est is not None:
-                        self._render_depth_window()
-                    key = cv2.waitKey(1) & 0xFF
-                    if not self._handle_key(key):
-                        break
-                else:
-                    time.sleep(max(0.0, frame_dt - (time.perf_counter() - t0)))
-
-                now = time.time()
-                dt = now - last_ui
-                last_ui = now
-                if dt > 0:
-                    inst = 1.0 / dt
-                    fps_ema = inst if fps_ema == 0 else 0.9 * fps_ema + 0.1 * inst
-                self.stats.ui_fps = fps_ema
-
-                elapsed = time.perf_counter() - t0
-                sleep_t = frame_dt - elapsed
-                if sleep_t > 0 and not self.headless:
-                    time.sleep(sleep_t)
-        finally:
-            if not self.headless:
-                try:
-                    cv2.destroyWindow(win)
-                except Exception:
-                    cv2.destroyAllWindows()
-
-    # ---------------------------------------------------------------- keys
-    def _handle_key(self, key: int) -> bool:
-        """Process one cv2.waitKey code. Returns False to quit."""
-        if key < 0 or key == 255:
-            return True
-
-        # ---- in-frame text box focused: type / edit / submit ----
-        if self._cv_input_focused:
-            if key in (13, 10):  # Enter
-                text = self._cv_input_buf.strip()
-                self._cv_input_buf = ""
-                self._cv_input_focused = False
-                if text:
-                    self.inject_text(text)
-                return True
-            if key == 27:  # Esc
-                self._cv_input_buf = ""
-                self._cv_input_focused = False
-                return True
-            if key in (8, 127):  # Backspace / Delete
-                if self._cv_input_buf:
-                    self._cv_input_buf = self._cv_input_buf[:-1]
-                return True
-            if key == 9:  # Tab — leave focus
-                self._cv_input_focused = False
-                return True
-            if 32 <= key < 127:
-                if len(self._cv_input_buf) < 120:
-                    self._cv_input_buf += chr(key)
-                return True
-            return True
-
-        # ---- shortcuts when not typing ----
-        if key in (ord("q"), 27):
-            return False
-        if key in (ord("t"), ord("/"), 13, 10):  # focus text box
-            self._cv_input_focused = True
-            if key in (ord("t"), ord("/")):
-                self._cv_input_buf = ""
-            return True
-        if key == ord("i"):
-            self.inject_text("这是什么")
-        elif key == ord("r"):
-            self.inject_text("记住这个叫测试物品")
-        elif key == ord("s"):
-            self.inject_text("帮我找测试物品")
-        elif key == ord("l"):
-            self.inject_text("你记住了什么")
-        elif key == ord("o"):
-            self._pick_and_recognize_file()
-        elif key == ord("h"):
-            log.info(
-                "keys: q=quit  t//=text box  i=identify  r=remember  "
-                "s=search  l=list  o=open image"
-            )
-        return True
-
-    def _pick_and_recognize_file(self) -> None:
-        """Open a file dialog on the UI thread, recognize the chosen image, speak."""
-        path = ""
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-
-            root = tk.Tk()
-            root.withdraw()
-            path = filedialog.askopenfilename(
-                title="选择要识别的图片",
-                filetypes=[
-                    ("Images", "*.jpg *.jpeg *.png *.bmp *.webp"),
-                    ("All files", "*.*"),
-                ],
-            )
-            root.destroy()
-        except Exception as e:
-            log.warning("file dialog failed: %s", e)
-            return
-        if not path:
-            return
-        reply = self.recognize_image_file(path)
-        self.stats.last_reply = reply
-        self._set_subtitle(f"助手：{reply}", 5.0)
-        self.push_chat("bot", reply)  # web chat bubble
-        self._mic_muted_until = time.time() + min(8.0, 1.0 + 0.18 * len(reply))
-        self.tts.say_async(reply)
-
 
 def _safe_name(name: str) -> str:
     keep = []

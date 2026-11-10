@@ -94,12 +94,12 @@ def main() -> int:
     mem.delete_object("测试杯子")
     mem.close()
 
-    # 4) cropper / position / visualizer (headless draw)
+    # 4) cropper / position / overlay state (no GUI in the classroom release)
     import cv2
 
     from vision.object_cropper import ObjectCropper
     from vision.position import describe_position
-    from vision.visualizer import OverlayState, Visualizer
+    from vision.visualizer import OverlayState
 
     frame = np.full((480, 640, 3), 180, dtype=np.uint8)
     cropper = ObjectCropper()
@@ -107,31 +107,21 @@ def main() -> int:
     crop = cropper.crop_box(frame, box)
     assert crop.size > 0
     pos = describe_position((50, 50, 200, 200), 640, 480)
-    viz = Visualizer()
-    st = OverlayState(status_line="smoke", learning=True, learning_label="测试")
-    out = viz.draw(frame, st)
-    assert out.shape == frame.shape
-    st2 = OverlayState(status_line="smoke", input_visible=True, input_focused=True, input_text="这是什么")
-    out2 = viz.draw(frame, st2)
-    assert out2.shape == frame.shape
-    from ui.text_input import TextInputWindow
+    st = OverlayState(learning=True, learning_label="测试")
+    assert st.learning and st.learning_label == "测试"
+    assert not cropper.quality_ok(np.zeros((80, 80, 3), dtype=np.uint8))  # blank rejected
+    print(f"[4] cropper/position/overlay OK pos={pos}")
 
-    ti = TextInputWindow(on_submit=lambda t: None)
-    assert ti.display_text == "" and not ti.is_typing
-    ti.set_echo("记住这个")
-    assert ti.display_text == "记住这个"
-    print(f"[4] cropper/position/visualizer+input OK pos={pos}")
+    # 5) depth model if present (zero-shot localization)
+    from vision.depth import DepthEstimator
 
-    # 5) YOLO load if models present (optional ROI helper)
-    from vision.detector import YoloDetector
-
-    yolo = YoloDetector(cfg.get("yolo", {}))
+    depth = DepthEstimator(cfg.get("depth", {}))
     try:
-        yolo.load()
-        dets, dt = yolo.infer(frame)
-        print(f"[5] YOLO OK device={yolo.device_used} dets={len(dets)} {dt:.1f}ms")
+        depth.load()
+        d = depth.estimate_depth(frame)
+        print(f"[5] depth OK device={depth.device_used} map={'yes' if d is not None else 'no'}")
     except Exception as e:
-        print(f"[5] YOLO SKIP/FAIL: {e}")
+        print(f"[5] depth SKIP/FAIL: {e}")
 
     # 6) ResNet18 load if model present (选题一 core)
     from vision.feature_extractor import ResNet18Extractor

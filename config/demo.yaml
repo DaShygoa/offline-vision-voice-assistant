@@ -21,12 +21,11 @@ asr:
   tokens: models/sherpa-onnx-paraformer-zh-int8/tokens.txt
   vad_model: models/silero_vad/silero_vad.onnx
 debug:
+  # 关闭画面落盘，避免把课堂参与者的肖像存入仓库/磁盘
   dir: data/debug
-  enabled: true
+  enabled: false
 depth:
-  decoder_path: models/mobile_sam/mobilesam_decoder.onnx
   enabled: true
-  encoder_path: models/mobile_sam/mobilesam_encoder.onnx
   expand_ratio: 0.06
   input_size: 518
   max_area_frac: 0.45
@@ -36,8 +35,6 @@ depth:
   near_percentile: 80.0
   onnx_threads: 4
   refresh_interval_sec: 0.5
-  show_depth_window: false
-  use_mobilesam: false
 memory:
   center_features: true
   center_roi_frac: 0.45
@@ -68,6 +65,8 @@ resnet18:
   onnx_path: models/resnet18/resnet18.onnx
   precision: FP32
 tts:
+  # edge = 微软在线合成（音色自然，需联网）；断网时自动降级为 mock 提示音
+  # mock = 纯本地提示音（无网络也能跑通全链路）
   edge_pitch: +0Hz
   edge_rate: +0%
   edge_voice: zh-CN-YunxiNeural
@@ -75,21 +74,4 @@ tts:
   mock_wav: data/tts_beep.wav
   mode: edge
   play_audio: true
-  prompt_lang: zh
-  prompt_text: 对我做了介绍啊那么我想说的话是呢大家如果对我的研究感兴趣呢你
-  ref_audio: models/gpt_sovits/ref_audio.wav
-  server_url: http://127.0.0.1:19880
   timeout_s: 30
-yolo:
-  allow_cpu_fallback: true
-  backend: onnxruntime
-  class_filter: null
-  conf_threshold: 0.4
-  device: cpu
-  enabled: false
-  every_n_frames: 4
-  input_size: 640
-  model_path: models/yolov8n/yolov8n.onnx
-  nms_threshold: 0.45
-  onnx_path: models/yolov8n/yolov8n.onnx
-  precision: FP32

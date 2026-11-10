@@ -119,7 +119,7 @@ class DebugCapture:
         self._report["candidates"].append(entry)
 
     def add_stage(self, name: str, **kv) -> None:
-        """Record an arbitrary pipeline event (e.g. MobileSAM refine result)."""
+        """Record an arbitrary pipeline event (e.g. depth candidate filter)."""
         if not self._dir:
             return
         self._report.setdefault("stages", []).append({"stage": name, **kv})

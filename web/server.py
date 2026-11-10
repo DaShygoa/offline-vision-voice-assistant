@@ -102,18 +102,7 @@ def _frame_loop():
             display = frame
             sx, sy = 1.0, 1.0
 
-        # draw detections (cv2 only, fast)
-        with a._det_lock:
-            dets = list(a._detections)
-        for d in dets:
-            bx1, by1, bx2, by2 = d.xyxy
-            x1, y1 = int(bx1 * sx), int(by1 * sy)
-            x2, y2 = int(bx2 * sx), int(by2 * sy)
-            cv2.rectangle(display, (x1, y1), (x2, y2), (255, 180, 60), 2)
-            cv2.putText(display, d.label, (x1, max(18, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 180, 60), 1, cv2.LINE_AA)
-
-        # draw highlight box (match result)
+        # draw highlight box (match result / depth candidate)
         if a._overlay.highlight and time.time() < a._flash_until:
             for box, label, conf in a._overlay.highlight:
                 x1 = int(box[0] * sx); y1 = int(box[1] * sy)
@@ -352,10 +341,9 @@ def main():
                    help="不打开麦克风（稍后可在网页上开启）")
     args = p.parse_args()
 
-    import yaml
-    cfg_path = args.config or os.path.join(ROOT, "config", "default.yaml")
-    with open(cfg_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    from core.config import load_config
+
+    cfg = load_config(args.config)
 
     # web mode: no OpenCV windows
     from core.app import AssistantApp

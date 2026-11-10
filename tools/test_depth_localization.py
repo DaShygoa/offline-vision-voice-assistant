@@ -33,13 +33,12 @@ def main() -> int:
 
     # load config
     import yaml
-    with open("config/default.yaml", encoding="utf-8") as f:
+    with open("config/demo.yaml", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     depth_cfg = cfg.get("depth", {})
 
-    # init depth estimator (without MobileSAM for this test)
+    # init depth estimator (depth-only; no mask refiner in the classroom release)
     from vision.depth import DepthEstimator
-    depth_cfg["use_mobilesam"] = False  # test depth-only path
     est = DepthEstimator(depth_cfg)
     print(f"Loading depth model: {depth_cfg.get('model_path')}")
     est.load()

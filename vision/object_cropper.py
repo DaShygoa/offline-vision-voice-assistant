@@ -1,13 +1,14 @@
-"""Object cropping: YOLO bbox first, else central ROI (MobileSAM is post-MVP)."""
+"""Object cropping for depth-guided zero-shot localization.
+
+The classroom release keeps only the central-ROI fallback and quality gating.
+The YOLO box path was removed: Depth Anything V2 is the sole locator, so the
+identity pipeline contains no pretrained category knowledge at all.
+"""
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 import cv2
 import numpy as np
-
-from .detector import Detection
 
 
 def expand_box(x1: float, y1: float, x2: float, y2: float, frame_w: int, frame_h: int, ratio: float = 0.06) -> tuple[int, int, int, int]:
@@ -30,6 +31,7 @@ class ObjectCropper:
         self.min_crop_px = int(min_crop_px)
 
     def center_roi(self, frame: np.ndarray) -> tuple[int, int, int, int]:
+        """Fallback region when depth estimation is unavailable: centre 45%."""
         h, w = frame.shape[:2]
         rw = int(w * self.center_roi_frac)
         rh = int(h * self.center_roi_frac)
@@ -58,88 +60,9 @@ class ObjectCropper:
             y2 = min(frame.shape[0], y2)
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
-            return frame[self.center_roi(frame)[1] : self.center_roi(frame)[3], self.center_roi(frame)[0] : self.center_roi(frame)[2]]
+            x1, y1, x2, y2 = self.center_roi(frame)
+            return frame[y1:y2, x1:x2]
         return crop
-
-    def best_center_detection(
-        self,
-        dets: List[Detection],
-        frame: np.ndarray,
-        class_id: Optional[int] = None,
-        min_iou: float = 0.15,
-    ) -> Optional[Detection]:
-        """Pick detection whose box overlaps the central ROI most (optionally filtered by class)."""
-        h, w = frame.shape[:2]
-        roi = np.array(self.center_roi(frame), dtype=np.float32)
-        best: Optional[Detection] = None
-        best_score = 0.0
-        for d in dets:
-            if class_id is not None and d.cls_id != class_id:
-                continue
-            # IoU of det with central ROI
-            x1 = max(float(d.xyxy[0]), float(roi[0]))
-            y1 = max(float(d.xyxy[1]), float(roi[1]))
-            x2 = min(float(d.xyxy[2]), float(roi[2]))
-            y2 = min(float(d.xyxy[3]), float(roi[3]))
-            inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-            roi_a = (float(roi[2] - roi[0])) * (float(roi[3] - roi[1]))
-            score = inter / roi_a if roi_a > 0 else 0.0
-            # prefer detections near center even if partially outside ROI
-            cx, cy = d.center
-            dist = np.hypot(cx - w / 2, cy - h / 2)
-            proximity = 1.0 - min(1.0, dist / (0.5 * np.hypot(w, h)))
-            total = 0.6 * score + 0.4 * proximity
-            if total > best_score:
-                best_score = total
-                best = d
-        if best is None or best_score < min_iou:
-            return None
-        return best
-
-    def crop_for_learning(
-        self,
-        frame: np.ndarray,
-        dets: List[Detection],
-        generic_class: Optional[str] = None,
-    ) -> tuple[np.ndarray, tuple[int, int, int, int], str]:
-        """Return (crop, box, source) where source is 'yolo' or 'center_roi'."""
-        class_id = None
-        if generic_class:
-            for i, name in enumerate(
-                [
-                    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
-                    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
-                    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
-                    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-                    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
-                    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
-                    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-                    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-                    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-                    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
-                    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
-                    "toothbrush",
-                ]
-            ):
-                if name == generic_class:
-                    class_id = i
-                    break
-        det = self.best_center_detection(dets, frame, class_id=class_id)
-        if det is None and class_id is None:
-            det = self.best_center_detection(dets, frame, class_id=None)
-        if det is not None:
-            box = expand_box(*det.xyxy, frame.shape[1], frame.shape[0])
-            return self.crop_box(frame, box), box, "yolo"
-        box = self.center_roi(frame)
-        return self.crop_box(frame, box), box, "center_roi"
-
-    def crop_detections(self, frame: np.ndarray, dets: List[Detection]) -> List[tuple[np.ndarray, tuple[int, int, int, int], Detection]]:
-        out = []
-        h, w = frame.shape[:2]
-        for d in dets:
-            box = expand_box(*d.xyxy, w, h)
-            out.append((self.crop_box(frame, box), box, d))
-        return out
 
     def quality_ok(self, crop: np.ndarray) -> bool:
         """Reject blank / too-dark / too-flat crops before embedding."""
