@@ -117,18 +117,23 @@ def _run_batch_recognize(cfg: dict, image_path: str) -> int:
         if emb is None:
             print("[err] feature extraction failed", file=sys.stderr)
             return 1
-        m = memory.best_match(emb)
+        ranked = memory.top_k(emb, k=2)
+        m = ranked[0] if ranked else None
         thr = memory.threshold
         if m is None:
             print("result: 未知物体 (feature bank empty)")
             return 0
-        pct = m.score * 100
+        pct = (m.raw_score if m.raw_score is not None else m.score) * 100
+        margin = m.score - ranked[1].score if len(ranked) > 1 else 1.0
+        if m.score >= thr and margin >= memory.margin_threshold:
+            print(f"result: {m.user_name}  raw_similarity={pct:.1f}%  decision_score={m.score*100:.1f}%  threshold={thr*100:.0f}%  [known]")
+            return 0
         if m.score >= thr:
-            print(f"result: {m.user_name}  similarity={pct:.1f}%  threshold={thr*100:.0f}%  [known]")
+            print(f"result: 不太确定  raw_similarity={pct:.1f}%  decision_margin={margin*100:.1f}%  [uncertain]")
             return 0
         print(
             f"result: 未知物体  best_candidate={m.user_name}  "
-            f"similarity={pct:.1f}%  threshold={thr*100:.0f}%  [unknown]"
+            f"raw_similarity={pct:.1f}%  decision_score={m.score*100:.1f}%  threshold={thr*100:.0f}%  [unknown]"
         )
         return 0
     finally:

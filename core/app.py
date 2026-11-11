@@ -84,8 +84,8 @@ class AssistantApp:
         # components
         self.camera = Camera(
             index=int(cfg.get("app", {}).get("camera_index", 0)),
-            width=int(cfg.get("app", {}).get("width", 1920)),
-            height=int(cfg.get("app", {}).get("height", 1080)),
+            width=int(cfg.get("app", {}).get("width") or 0),
+            height=int(cfg.get("app", {}).get("height") or 0),
         )
         self.resnet = ResNet18Extractor(cfg.get("resnet18", {}))
         self.memory = VisualMemory(cfg.get("memory", {}))
@@ -546,15 +546,20 @@ class AssistantApp:
                 return self._is_face_candidate(raw, support)
         return self._is_face_candidate(raw) or self._is_face_candidate(crop)
 
+    @staticmethod
+    def _raw_match_score(m: MemoryMatch) -> float:
+        score = getattr(m, "raw_score", None)
+        return float(m.score if score is None else score)
+
     def _describe_known(self, m: MemoryMatch) -> str:
-        pct = int(round(m.score * 100))
+        raw = self._raw_match_score(m)
+        pct = int(round(raw * 100))
         name = m.user_name.strip()
-        if name.startswith("我的") or name.startswith("你的") or name.startswith("他的"):
-            base = f"这是{name}"
-        else:
-            base = f"这是你的{name}"
-        self.stats.last_similarity = m.score
-        return f"{base}，相似度{pct}%。"
+        # The feature bank cannot establish physical identity of an object.
+        base = f"匹配到已录入的「{name}」"
+        self.stats.last_similarity = raw
+        detail = f"（中心化判定分数{int(round(m.score * 100))}%）" if getattr(m, "centered", False) else ""
+        return f"{base}，原始相似度{pct}%{detail}。"
 
     def _describe_unknown(self, m: Optional[MemoryMatch]) -> str:
         thr = int(round(self.memory.threshold * 100))
@@ -563,9 +568,12 @@ class AssistantApp:
             if self.memory.stats()["objects"] == 0:
                 return "未知物体。特征库还是空的，先说：记住，这个叫……"
             return "未知物体。"
-        pct = int(round(m.score * 100))
-        self.stats.last_similarity = m.score
-        return f"未知物体，最高相似度{pct}%（阈值{thr}%）。"
+        raw = self._raw_match_score(m)
+        pct = int(round(raw * 100))
+        self.stats.last_similarity = raw
+        if getattr(m, "centered", False):
+            return f"未知物体，候选原始相似度{pct}%（中心化判定分数{int(round(m.score * 100))}%，阈值{thr}%）。"
+        return f"未知物体，最高原始相似度{pct}%（阈值{thr}%）。"
 
     # ---------------------------------------------------------- identify
     def _do_identify(self) -> str:
@@ -589,6 +597,7 @@ class AssistantApp:
         cand_labels: List[str] = []
         candidates: list[dict] = []
         best_idx = -1
+        best_is_confident = False
 
         # 1) Depth-guided candidates (zero-shot, category-free — preferred path).
         # Depth is ambiguous in cluttered scenes, so evaluate the top-k regions and
@@ -662,14 +671,24 @@ class AssistantApp:
                         continue
                     top = self.memory.top_k(emb, k=3) if hasattr(self.memory, "top_k") else []
                     if m is not None:
-                        candidate.update(name=m.user_name, score=float(m.score), reason="matched")
+                        candidate.update(name=m.user_name, score=self._raw_match_score(m),
+                                         decision_score=float(m.score) if getattr(m, "centered", False) else None,
+                                         reason="matched")
                     top_list = [{"name": t.user_name, "score": round(float(t.score), 4)} for t in top]
-                    is_better = bool(m and (best is None or m.score > best.score))
+                    candidate_margin = m.score - top[1].score if m is not None and len(top) > 1 else 1.0
+                    is_confident = bool(m and m.score >= self.memory.threshold
+                                        and candidate_margin >= self.memory.margin_threshold)
+                    # A higher-scoring but ambiguous candidate must not hide a
+                    # different candidate that passes both decision checks.
+                    is_better = bool(m and (best is None
+                        or (is_confident and not best_is_confident)
+                        or (is_confident == best_is_confident and m.score > best.score)))
                     if is_better:
                         best, best_box = m, box
                         best_region = region
                         best_emb = emb
                         best_idx = len(cand_boxes) - 1
+                        best_is_confident = is_confident
                     cand_labels.append(f"{ri}:{m.user_name if m else '?'}"
                                        f" {m.score:.2f}" if m else f"{ri}:none")
                     dc.add_candidate(crop, box, region.score, region.area_frac, "depth",
@@ -719,7 +738,9 @@ class AssistantApp:
                 return "特征提取失败，请检查 ResNet18 模型。"
             best_emb = emb
             if best is not None:
-                candidate.update(name=best.user_name, score=float(best.score), reason="matched")
+                candidate.update(name=best.user_name, score=self._raw_match_score(best),
+                                 decision_score=float(best.score) if getattr(best, "centered", False) else None,
+                                 reason="matched")
             else:
                 candidate["reason"] = "no_match"
             self._show_candidate_snapshot(frame, candidates)
@@ -757,19 +778,29 @@ class AssistantApp:
         margin_need = float(self.memory.margin_threshold)
         if best is None or best.score < self.memory.threshold or margin < margin_need:
             if best is not None and margin < margin_need and best.score >= self.memory.threshold:
-                text = (f"不太确定，看起来像{best.user_name}（{int(best.score*100)}%），"
-                        f"但{runner_up}也很相似（差距仅{int(margin*100)}%）。"
+                space = "中心化判定分数" if getattr(best, "centered", False) else "相似度"
+                text = (f"不太确定，看起来像{best.user_name}（原始相似度{int(round(self._raw_match_score(best)*100))}%，"
+                        f"{space}{int(best.score*100)}%），但{runner_up}也很相似（判定分数差距仅{int(margin*100)}%）。"
                         f"换个角度或背景再试试。")
+                dc.finish(text, decision="uncertain", asr_text=self.stats.last_intent)
+            elif (best is not None and getattr(best, "centered", False)
+                  and best.score >= self.memory.threshold - max(0.0, float(
+                      self.cfg.get("memory", {}).get("borderline_band_centered", 0.10)))):
+                # Near-threshold candidates are suggestions, not accepted matches.
+                self.stats.last_similarity = self._raw_match_score(best)
+                text = (f"不太确定，可能与已录入的「{best.user_name}」相似（原始相似度{int(round(self._raw_match_score(best)*100))}%，"
+                        f"中心化判定分数{int(round(best.score*100))}%，阈值{int(round(self.memory.threshold*100))}%）；"
+                        "尚不能确认是同类或同一个物品。")
                 dc.finish(text, decision="uncertain", asr_text=self.stats.last_intent)
             else:
                 text = self._describe_unknown(best)
                 dc.finish(text, decision="unknown", asr_text=self.stats.last_intent)
             if best_box is not None and best is not None:
-                self._flash_match(best_box, "未知物体", best.score)
+                self._flash_match(best_box, "未知物体", self._raw_match_score(best), (frame.shape[1], frame.shape[0]))
             return text
 
         if best_box is not None:
-            self._flash_match(best_box, best.user_name, best.score)
+            self._flash_match(best_box, best.user_name, self._raw_match_score(best), (frame.shape[1], frame.shape[0]))
         text = self._describe_known(best)
         dc.finish(text, decision="matched",
                   asr_text=self.stats.last_intent)
@@ -974,8 +1005,10 @@ class AssistantApp:
         if self.cropper.quality_ok(crop):
             emb = self._embed_crop(crop)
             if emb is not None:
-                m = self.memory.best_match(emb)
-                if m and (
+                ranked = self.memory.top_k(emb, k=2)
+                m = ranked[0] if ranked else None
+                margin = m.score - ranked[1].score if len(ranked) > 1 else 1.0
+                if m and m.score >= self.memory.threshold and margin >= self.memory.margin_threshold and (
                     _name_related(label, m.user_name)
                     or (obj and m.object_id == obj.object_id)
                 ):
@@ -989,12 +1022,10 @@ class AssistantApp:
             return f"画面里没有找到{label}。"
         pos = describe_position(best_box, w, h)
         name = best_mem.user_name if best_mem else label
-        self._flash_match(best_box, name, max(best_score, 0.0))
-        n = name.strip()
-        pct = int(round(max(best_score, 0.0) * 100))
-        if n.startswith("我的") or n.startswith("你的"):
-            return f"找到{n}了，在{pos}（相似度{pct}%）。"
-        return f"找到你的{n}了，在{pos}（相似度{pct}%）。"
+        display_score = self._raw_match_score(best_mem) if best_mem else max(best_score, 0.0)
+        self._flash_match(best_box, name, display_score, (w, h))
+        pct = int(round(display_score * 100))
+        return f"画面中匹配到已录入的「{name.strip()}」，在{pos}（相似度{pct}%）。"
 
     # ------------------------------------------------------- local image
     def recognize_image_file(self, path: str) -> str:
@@ -1008,9 +1039,12 @@ class AssistantApp:
         self.stats.embed_latency_ms = ms
         if emb is None:
             return "特征提取失败，换一张图片试试。"
-        m = self.memory.best_match(emb)
+        ranked = self.memory.top_k(emb, k=2)
+        m = ranked[0] if ranked else None
         if m is None or m.score < self.memory.threshold:
             reply = self._describe_unknown(m)
+        elif len(ranked) > 1 and m.score - ranked[1].score < self.memory.margin_threshold:
+            reply = f"不太确定，候选物体之间的判定分数太接近，请换个角度再试。"
         else:
             reply = self._describe_known(m)
         log.info("recognize_file %s → %s", os.path.basename(path), reply)
@@ -1077,12 +1111,13 @@ class AssistantApp:
         self._overlay.candidate_snapshot = (
             time.time() + 4.0, width, height,
             tuple((tuple(int(value) for value in c["box"]), c.get("name"),
-                   c.get("score"), c.get("reason", "no_match")) for c in candidates),
+                   c.get("score"), c.get("reason", "no_match"), c.get("decision_score")) for c in candidates),
         )
 
     # ------------------------------------------------------------- utils
-    def _flash_match(self, box, label: str, score: float) -> None:
+    def _flash_match(self, box, label: str, score: float, frame_size: tuple[int, int]) -> None:
         self._overlay.highlight = [(np.asarray(box, dtype=np.float32), label, float(score))]
+        self._overlay.highlight_size = frame_size
         self._overlay.match_box = np.asarray(box, dtype=np.float32)
         self._overlay.match_label = label
         self._flash_until = time.time() + 4.0
@@ -1148,6 +1183,8 @@ class AssistantApp:
                 log.warning("camera toggle failed: %s", e)
                 return self._camera_enabled
             self._camera_enabled = bool(enabled)
+            self._overlay.candidate_snapshot = (0.0, 0, 0, ())
+            self._flash_until = 0.0
         self.stats.camera_enabled = self._camera_enabled
         log.info("Camera %s", "started" if self._camera_enabled else "released")
         return self._camera_enabled
@@ -1207,6 +1244,11 @@ class AssistantApp:
             except Exception as e:
                 log.warning("camera switch to %s failed: %s", index, e)
                 return False
+            self._overlay.candidate_snapshot = (0.0, 0, 0, ())
+            self._flash_until = 0.0
+            with self._depth_lock:
+                self._depth_heatmap = None
+                self._depth_box = None
             # While the camera is released reopen() does not touch the device;
             # that is intentional — DSHOW probes are flaky (a busy driver can
             # refuse an otherwise valid index), and the picker only offers
@@ -1283,9 +1325,12 @@ class AssistantApp:
         camera_label = (f"{name}（索引 {self.camera.index}）"
                         if name != f"摄像头 {self.camera.index}"
                         else name)
+        width, height = getattr(self.camera, "frame_size", (0, 0))
         return {
             "camera_index": self.camera.index,
             "camera_label": camera_label,
+            "camera_width": width,
+            "camera_height": height,
             "mic_device": mic,
             "mic_label": mic_label,
         }

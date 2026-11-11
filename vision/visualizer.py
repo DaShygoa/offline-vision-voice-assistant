@@ -21,5 +21,6 @@ class OverlayState:
     match_box: Optional[np.ndarray] = None
     match_label: str = ""
     highlight: List[tuple] = field(default_factory=list)  # (box, label, conf)
+    highlight_size: tuple[int, int] = (0, 0)  # width, height of the source frame
     # Atomic snapshot: (expiry, source width, source height, candidate tuples).
     candidate_snapshot: tuple = (0.0, 0, 0, ())

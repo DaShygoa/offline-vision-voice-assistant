@@ -53,6 +53,17 @@ def _encode_jpeg(img: np.ndarray, quality: int = 80) -> bytes:
     return buf.tobytes() if ok else b""
 
 
+def _resize_for_stream(frame: np.ndarray, max_width: int, max_height: int):
+    """Fit within the stream bounds without changing aspect ratio or upscaling."""
+    height, width = frame.shape[:2]
+    scale = min(1.0, max_width / width, max_height / height)
+    out_w = max(1, int(round(width * scale)))
+    out_h = max(1, int(round(height * scale)))
+    if (out_w, out_h) == (width, height):
+        return frame.copy(), 1.0, 1.0
+    return cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA), out_w / width, out_h / height
+
+
 def _mjpeg_part(jpeg: bytes) -> bytes:
     return b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
 
@@ -73,7 +84,7 @@ def _frame_loop():
 
     fps_ema = 0.0
     last_t = time.perf_counter()
-    # stream resolution (encode cost drops ~6x vs 1080p; browser scales it back up)
+    # Maximum stream size; preserve the camera's actual aspect ratio.
     VW, VH = 960, 540
     DW, DH = 640, 360
     # depth heatmap only changes at ~2 Hz — cache its JPEG, never re-encode per frame
@@ -104,15 +115,11 @@ def _frame_loop():
 
         # downscale FIRST, then draw + encode (1080p JPEG encode costs ~12ms vs ~2ms)
         fh, fw = frame.shape[:2]
-        if (fw, fh) != (VW, VH):
-            display = cv2.resize(frame, (VW, VH), interpolation=cv2.INTER_AREA)
-            sx, sy = VW / fw, VH / fh
-        else:
-            display = frame
-            sx, sy = 1.0, 1.0
+        display, sx, sy = _resize_for_stream(frame, VW, VH)
 
         # draw highlight box (match result / depth candidate)
-        if a._overlay.highlight and time.time() < a._flash_until:
+        if (a._overlay.highlight and a._overlay.highlight_size == (fw, fh)
+                and time.time() < a._flash_until):
             for box, label, conf in a._overlay.highlight:
                 x1 = int(box[0] * sx); y1 = int(box[1] * sy)
                 x2 = int(box[2] * sx); y2 = int(box[3] * sy)
@@ -123,7 +130,7 @@ def _frame_loop():
         # subtitle bar at top
         sub = a._last_subtitle if time.time() < a._subtitle_until else ""
         if sub:
-            cv2.rectangle(display, (0, 0), (VW, 30), (30, 30, 30), -1)
+            cv2.rectangle(display, (0, 0), (display.shape[1], 30), (30, 30, 30), -1)
             cv2.putText(display, sub[:70], (10, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1, cv2.LINE_AA)
 
@@ -136,13 +143,7 @@ def _frame_loop():
                 heatmap = a._depth_heatmap
                 box = a._depth_box
             if heatmap is not None and heatmap is not last_depth_obj:
-                h2, w2 = heatmap.shape[:2]
-                if (w2, h2) != (DW, DH):
-                    d_disp = cv2.resize(heatmap, (DW, DH), interpolation=cv2.INTER_AREA)
-                    dsx, dsy = DW / w2, DH / h2
-                else:
-                    d_disp = heatmap
-                    dsx, dsy = 1.0, 1.0
+                d_disp, dsx, dsy = _resize_for_stream(heatmap, DW, DH)
                 if box is not None:
                     x1 = int(box[0] * dsx); y1 = int(box[1] * dsy)
                     x2 = int(box[2] * dsx); y2 = int(box[3] * dsy)
@@ -202,9 +203,12 @@ def status():
         return jsonify({"ready": False})
     s = _assistant.stats
     expires, width, height, boxes = _assistant._overlay.candidate_snapshot
+    devices_info = _assistant.current_devices
+    frame_width, frame_height = devices_info.get("camera_width", 0), devices_info.get("camera_height", 0)
+    same_frame_size = not (frame_width and frame_height) or (width, height) == (frame_width, frame_height)
     return jsonify({
         "ready": True,
-        **_assistant.current_devices,
+        **devices_info,
         "fps": round(s.ui_fps, 1),
         "mode": s.mode,
         "last_intent": s.last_intent,
@@ -222,9 +226,10 @@ def status():
         "camera_enabled": _assistant.camera_enabled,
         "mic_enabled": _assistant.mic_enabled,
         "candidate_boxes": {"width": width, "height": height,
-                            "boxes": [{"box": box, "name": name, "score": score, "reason": reason}
-                                      for box, name, score, reason in boxes]}
-        if time.time() < expires and _assistant.camera_enabled and _assistant.recognition_enabled else None,
+                            "boxes": [{"box": box, "name": name, "score": score, "reason": reason,
+                                       "decision_score": decision_score}
+                                      for box, name, score, reason, decision_score in boxes]}
+        if time.time() < expires and same_frame_size and _assistant.camera_enabled and _assistant.recognition_enabled else None,
     })
 
 

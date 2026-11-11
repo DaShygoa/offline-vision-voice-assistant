@@ -14,10 +14,12 @@ log = logging.getLogger(__name__)
 
 
 class Camera:
-    def __init__(self, index: int = 0, width: int = 1920, height: int = 1080, fps: int = 30):
+    def __init__(self, index: int = 0, width: int = 0, height: int = 0, fps: int = 30):
         self.index = index
-        self.width = width
-        self.height = height
+        self.requested_width = int(width or 0)
+        self.requested_height = int(height or 0)
+        self.width = 0
+        self.height = 0
         self.fps = fps
         self._cap: Optional[cv2.VideoCapture] = None
         self._lock = threading.Lock()
@@ -31,19 +33,23 @@ class Camera:
         backend = getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)
         cap = cv2.VideoCapture(self.index, backend)
         if not cap.isOpened():
+            cap.release()
             cap = cv2.VideoCapture(self.index)
         if not cap.isOpened():
+            cap.release()
             raise RuntimeError(f"Cannot open camera index {self.index}")
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        if self.requested_width > 0 and self.requested_height > 0:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.requested_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.requested_height)
         cap.set(cv2.CAP_PROP_FPS, self.fps)
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
         self._cap = cap
-        self.width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or self.width
-        self.height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or self.height
+        self.width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        self.height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        log.info("Camera %s opened; reported resolution %sx%s", self.index, self.width, self.height)
 
     def start(self) -> None:
         if self._cap is None:
@@ -68,6 +74,7 @@ class Camera:
                 self._fps_ema = inst if self._fps_ema == 0 else 0.9 * self._fps_ema + 0.1 * inst
             with self._lock:
                 self._frame = frame
+                self.height, self.width = frame.shape[:2]
                 self._frame_id += 1
 
     def latest(self) -> tuple[Optional[np.ndarray], int]:
@@ -79,6 +86,12 @@ class Camera:
     @property
     def capture_fps(self) -> float:
         return self._fps_ema
+
+    @property
+    def frame_size(self) -> tuple[int, int]:
+        """Actual dimensions of the latest frame; (0, 0) before first frame."""
+        with self._lock:
+            return (self._frame.shape[1], self._frame.shape[0]) if self._frame is not None else (0, 0)
 
     def stop(self) -> None:
         self._running = False

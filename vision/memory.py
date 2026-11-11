@@ -32,6 +32,8 @@ class MemoryMatch:
     generic_class: Optional[str]
     score: float
     rank: int
+    raw_score: Optional[float] = None
+    centered: bool = False
 
 
 @dataclass
@@ -55,6 +57,8 @@ class VisualMemory:
         self.samples_dir = cfg.get("samples_dir", "data/samples")
         self.embeddings_path = cfg.get("embeddings_path", "data/resnet18_embeddings.npz")
         self._threshold = float(cfg.get("match_threshold", 0.65))
+        # A single-class bank has no competing class for a margin check.
+        self._single_threshold = float(cfg.get("single_match_threshold", self._threshold))
         # Common-component removal. ResNet18 avgpool features are ~87% "common
         # component" (lighting / texture / background statistics shared by every
         # photo), so two completely different objects still score ~0.6 cosine.
@@ -201,6 +205,8 @@ class VisualMemory:
         """Score threshold for the space currently in use."""
         if self.centering_active:
             return self._threshold_centered
+        if len(set(self._row_object_id)) == 1:
+            return self._single_threshold
         return self._threshold
 
     @property
@@ -351,6 +357,13 @@ class VisualMemory:
                 log.warning("query dim %d != bank dim %d", qq.shape[0], mat.shape[1])
                 return []
             scores = mat @ qq
+            # Expose the same raw cosine scale regardless of whether ranking
+            # uses a bank-centered space. Compute per object independently.
+            raw_scores = self._matrix @ _l2(embedding)
+            raw_best: dict[int, float] = {}
+            for oid, score in zip(self._row_object_id, raw_scores):
+                oid = int(oid)
+                raw_best[oid] = max(raw_best.get(oid, -float('inf')), float(score))
             best: dict[int, float] = {}
             for i, s in enumerate(scores):
                 oid = int(row_ids[i])
@@ -371,6 +384,8 @@ class VisualMemory:
                         generic_class=info[1] if info else None,
                         score=s,
                         rank=rank,
+                        raw_score=raw_best[oid],
+                        centered=self.centering_active,
                     )
                 )
             return out

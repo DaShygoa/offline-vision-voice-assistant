@@ -143,6 +143,8 @@ python web/server.py --config config/demo.yaml --port 5001 --camera-index 1 --mi
 
 `--mic-device` 可填 sounddevice 的设备索引或名称；`config/demo.yaml` 中的
 `app.camera_index` / `asr.mic_device` 是对应默认值，网页上的选择即时生效、无需重启。
+摄像头默认采用设备的分辨率，预览按画面原比例缩放；鼠标停在摄像头开关上可查看当前实际分辨率。
+如需请求指定分辨率，可在 `config/demo.yaml` 将 `app.width` 和 `app.height` 同时设为正整数；实际输出取决于设备支持情况。
 
 ## 课堂演示话术（建议提前彩排）
 
@@ -207,7 +209,7 @@ flowchart LR
 ```
 
 定位与身份分离：深度模型只回答「剪哪一块」，名称完全来自特征库检索。
-余弦相似度是特征空间的匹配分数，**不是识别概率**，会受视角、光照、背景和库内物体影响。
+界面显示的原始余弦相似度始终使用未中心化的特征，便于比较单物体与多物体库；多物体库的最终判定仍使用中心化分数，因此输出会另行标明判定分数。原始相似度是匹配分数，**不是识别概率**，会受视角、光照和背景影响。
 
 ## 关键配置（`config/demo.yaml`）
 
@@ -215,15 +217,17 @@ flowchart LR
 | --- | --- | --- |
 | `memory.center_features` | `true` | 减去特征库共同成分再算相似度（实测 ResNet18 有 ~86% 分量是所有图片共有的） |
 | `memory.match_threshold_centered` | `0.5` | 中心化后的拒识阈值 |
+| `memory.borderline_band_centered` | `0.10` | 中心化分数接近但低于阈值时提示相似候选，不视为已确认的同类或同一物品 |
 | `memory.margin_threshold_centered` | `0.15` | 第一名与第二名（不同物体）的最小分差，否则答「不太确定」 |
-| `memory.match_threshold` | `0.7` | 未中心化时的阈值（库里少于 2 个物体时自动回退） |
+| `memory.single_match_threshold` | `0.85` | 只有一个物体时的原始余弦阈值；提高阈值可减少误认，也可能增加漏识 |
+| `memory.match_threshold` | `0.7` | 多物体但未启用中心化时的原始余弦阈值 |
 | `memory.min_samples` / `max_samples` | `3` / `10` | 一次录入的样本数上下限 |
 | `depth.enabled` | `true` | 深度零样本定位；关掉则回退画面中心 45% |
 | `debug.enabled` | `false` | 默认不落盘画面，避免存入课堂参与者肖像 |
 | `tts.mode` | `offline` | 本地中文语音；首次运行 `python tools/prepare_models.py --tts` 下载模型。设为 `edge` 可使用在线语音，失败时回退到离线语音 |
 
 > **0.5 是针对当前演示的拒识设置，不是通用最优阈值**。换物体集合后边界会变，
-> 可据现场效果微调；只有已录入物体 ≥2 个时才启用中心化阈值。
+> 可据现场效果微调；只有已录入物体 ≥2 个时才启用中心化阈值。单物体阈值 0.85 只是针对现有少量案例的保守设置，并不能保证拒绝所有未知物体。
 
 ## 语音播报与离线边界
 

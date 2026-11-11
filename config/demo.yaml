@@ -1,12 +1,13 @@
 app:
   # 默认摄像头索引（网页「设备设置」里可随时切换）
   camera_index: 0
-  height: 1080
+  # 0 = 使用摄像头默认分辨率；需要指定时将 width 和 height 都设为正整数
+  height: 0
   locale: zh
   text_input: false
   text_input_always: false
   ui_fps_target: 30
-  width: 1920
+  width: 0
 asr:
   # 麦克风设备：null = 系统默认输入；也可填 sounddevice 的设备索引或名称
   # 运行时可在网页「设备设置」里切换，无需改配置文件
@@ -48,6 +49,10 @@ memory:
   margin_threshold_centered: 0.15
   match_threshold: 0.7
   match_threshold_centered: 0.5
+  # 接近阈值但未通过时提示候选，不将其认定为已识别
+  borderline_band_centered: 0.10
+  # 单物体库没有第二名可比较，使用更严格的原始余弦阈值
+  single_match_threshold: 0.85
   max_samples: 10
   min_crop_px: 64
   min_samples: 3
