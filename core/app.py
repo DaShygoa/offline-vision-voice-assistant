@@ -23,6 +23,8 @@ import collections
 import logging
 import os
 import queue
+import shutil
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -567,6 +569,7 @@ class AssistantApp:
 
     # ---------------------------------------------------------- identify
     def _do_identify(self) -> str:
+        self._overlay.candidate_snapshot = (0.0, 0, 0, ())
         if not self.recognition_enabled:
             return "识别已暂停，请先点击右上角的「开始识别」。"
         frame, _ = self.camera.latest()
@@ -584,6 +587,7 @@ class AssistantApp:
         best_emb: Optional[np.ndarray] = None
         cand_boxes: List[tuple] = []
         cand_labels: List[str] = []
+        candidates: list[dict] = []
         best_idx = -1
 
         # 1) Depth-guided candidates (zero-shot, category-free — preferred path).
@@ -607,16 +611,23 @@ class AssistantApp:
                     if region.mean_depth - ref_depth > self.depth_gate:
                         cand_boxes.append(region.box)
                         cand_labels.append(f"{ri}:too_far")
+                        candidates.append({"box": region.box, "reason": "too_far"})
                         dc.add_candidate(None, region.box, region.score, region.area_frac,
                                          "depth", match_name="too_far")
                         continue
                     r = self.depth_est.crop_region(frame, region)
                     if r is None:
+                        cand_boxes.append(region.box)
+                        cand_labels.append(f"{ri}:no_crop")
+                        candidates.append({"box": region.box, "reason": "no_crop"})
                         continue
                     crop, box = r
                     cand_boxes.append(box)
+                    candidate = {"box": box, "reason": "no_match"}
+                    candidates.append(candidate)
                     m = None
                     if not self.cropper.quality_ok(crop):
+                        candidate["reason"] = "quality_fail"
                         cand_labels.append(f"{ri}:quality_fail")
                         dc.add_candidate(crop, box, region.score, region.area_frac,
                                          "depth", mask=region.mask, match_name="quality_fail")
@@ -625,6 +636,7 @@ class AssistantApp:
                     # mask-cleaned crop — masking replaces skin with median colour
                     # and defeats skin-based detection (measured: skin 0.10 → miss).
                     if self._depth_candidate_is_face(frame, crop, box, region):
+                        candidate["reason"] = "face_rejected"
                         cand_labels.append(f"{ri}:face_rejected")
                         dc.add_candidate(crop, box, region.score, region.area_frac,
                                          "depth", mask=region.mask, match_name="face_rejected")
@@ -634,6 +646,7 @@ class AssistantApp:
                     rb = region.box
                     bbox_frac = ((rb[2]-rb[0]) * (rb[3]-rb[1])) / float(frame.shape[0]*frame.shape[1])
                     if bbox_frac > 0.50:
+                        candidate["reason"] = "too_large"
                         cand_labels.append(f"{ri}:too_large")
                         dc.add_candidate(crop, box, region.score, region.area_frac,
                                          "depth", mask=region.mask, match_name="too_large")
@@ -642,11 +655,14 @@ class AssistantApp:
                             if region.mask is not None else None)
                     emb, m = self._match_crop(crop, mask)
                     if emb is None:
+                        candidate["reason"] = "no_embed"
                         cand_labels.append(f"{ri}:no_embed")
                         dc.add_candidate(crop, box, region.score, region.area_frac,
                                          "depth", mask=region.mask, match_name="no_embed")
                         continue
                     top = self.memory.top_k(emb, k=3) if hasattr(self.memory, "top_k") else []
+                    if m is not None:
+                        candidate.update(name=m.user_name, score=float(m.score), reason="matched")
                     top_list = [{"name": t.user_name, "score": round(float(t.score), 4)} for t in top]
                     is_better = bool(m and (best is None or m.score > best.score))
                     if is_better:
@@ -668,6 +684,8 @@ class AssistantApp:
                 elif regions:
                     self._update_depth_vis(frame, regions[0].box)
 
+                self._show_candidate_snapshot(frame, candidates)
+
         # 2) center ROI fallback (last resort) — ONLY when depth was unavailable.
         # If depth ran and every candidate was rejected (face / too_far / quality),
         # the scene has no showable object; falling through to the centre ROI would
@@ -684,18 +702,28 @@ class AssistantApp:
         if best is None:
             box = self.cropper.center_roi(frame)
             crop = self.cropper.crop_box(frame, box)
+            cand_boxes.append(box)
+            cand_labels.append("center")
+            candidate = {"box": box, "reason": "quality_fail"}
+            candidates.append(candidate)
             if not self.cropper.quality_ok(crop):
+                self._show_candidate_snapshot(frame, candidates)
                 dc.add_frame_annotated(frame, cand_boxes, cand_labels, best_idx)
                 dc.finish("我看不清这个物品", decision="quality_fail")
                 return "我看不清这个物品，试着把它放到画面中央亮一点。"
             emb, best = self._match_crop(crop)
             if emb is None:
+                candidate["reason"] = "no_embed"
+                self._show_candidate_snapshot(frame, candidates)
                 dc.finish("特征提取失败", decision="no_embed")
                 return "特征提取失败，请检查 ResNet18 模型。"
             best_emb = emb
+            if best is not None:
+                candidate.update(name=best.user_name, score=float(best.score), reason="matched")
+            else:
+                candidate["reason"] = "no_match"
+            self._show_candidate_snapshot(frame, candidates)
             best_box = box
-            cand_boxes.append(box)
-            cand_labels.append("center")
             best_idx = len(cand_boxes) - 1
             dc.add_candidate(crop, box, 0.0, 0.0, "center",
                              match_name=best.user_name if best else "",
@@ -990,36 +1018,67 @@ class AssistantApp:
 
     def enroll_from_paths(self, label: str, paths: List[str]) -> str:
         """Enroll an object from local image files (batch / CLI)."""
-        if not label:
-            return "缺少物体名称。"
+        try:
+            return self.enroll_image_files(label, paths)
+        except (ValueError, FileExistsError, RuntimeError) as e:
+            return str(e)
+
+    def enroll_image_files(self, label: str, paths: List[str]) -> str:
+        """Add a new object from image files, preserving existing samples on failure."""
+        label = label.strip()
+        if not label or len(label) > 80:
+            raise ValueError("请输入不超过80个字符的物体名称。")
         if not getattr(self.resnet, "ready", False):
-            return "ResNet18 特征模型未加载，无法录入。"
+            raise RuntimeError("ResNet18 特征模型未加载，无法录入。")
         min_samples = int(self.cfg.get("memory", {}).get("min_samples", 3))
-        obj_dir = os.path.join(self.cfg["memory"]["samples_dir"], _safe_name(label))
-        os.makedirs(obj_dir, exist_ok=True)
+        max_samples = int(self.cfg.get("memory", {}).get("max_samples", 10))
+        if not min_samples <= len(paths) <= max_samples:
+            raise ValueError(f"请选择 {min_samples} 到 {max_samples} 张图片。")
         embeds: List[np.ndarray] = []
+        images: List[np.ndarray] = []
         saved: List[str] = []
-        for i, src in enumerate(paths):
+        for src in paths:
             img = imread_unicode(src)
-            if img is None:
-                log.warning("unreadable image skipped: %s", src)
+            if img is None or not self.cropper.quality_ok(img):
                 continue
             emb = self.resnet.embed(img)
             if emb is None:
                 continue
-            dest = os.path.join(obj_dir, f"s{len(embeds):02d}.png")
-            imwrite_unicode(dest, img)
             embeds.append(emb)
-            saved.append(dest)
+            images.append(img)
         if len(embeds) < min_samples:
-            return (
+            raise ValueError(
                 f"录入失败：有效图片 {len(embeds)}/{len(paths)}，至少需要 {min_samples} 张。"
             )
-        self.memory.add_object(label, None, embeds, saved)
+        root = self.cfg["memory"]["samples_dir"]
+        os.makedirs(root, exist_ok=True)
+        obj_dir = tempfile.mkdtemp(prefix="import-", dir=root)
+        try:
+            for i, img in enumerate(images):
+                dest = os.path.join(obj_dir, f"s{i:02d}.png")
+                if not imwrite_unicode(dest, img):
+                    raise RuntimeError("保存样本图片失败。")
+                saved.append(dest)
+            self.memory.add_object(label, None, embeds, saved, replace_existing=False)
+        except FileExistsError:
+            shutil.rmtree(obj_dir, ignore_errors=True)
+            raise FileExistsError(f"物体「{label}」已存在，请使用其他名称。")
+        except Exception:
+            shutil.rmtree(obj_dir, ignore_errors=True)
+            raise
         st = self.memory.stats()
         self.stats.mem_objects = st["objects"]
         self._refresh_mem_info()
         return f"好的，我已经记住{label}了（{len(embeds)}张图片，ResNet18特征）。"
+
+    def _show_candidate_snapshot(self, frame: np.ndarray, candidates: List[dict]) -> None:
+        """Publish this identification's candidate boxes for four seconds."""
+        height, width = frame.shape[:2]
+        self._overlay.candidate_snapshot = (
+            time.time() + 4.0, width, height,
+            tuple((tuple(int(value) for value in c["box"]), c.get("name"),
+                   c.get("score"), c.get("reason", "no_match")) for c in candidates),
+        )
 
     # ------------------------------------------------------------- utils
     def _flash_match(self, box, label: str, score: float) -> None:

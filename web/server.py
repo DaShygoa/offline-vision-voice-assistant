@@ -15,6 +15,7 @@ import io
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 from typing import Optional
@@ -200,6 +201,7 @@ def status():
     if _assistant is None:
         return jsonify({"ready": False})
     s = _assistant.stats
+    expires, width, height, boxes = _assistant._overlay.candidate_snapshot
     return jsonify({
         "ready": True,
         **_assistant.current_devices,
@@ -219,6 +221,10 @@ def status():
         "recognition_enabled": _assistant.recognition_enabled,
         "camera_enabled": _assistant.camera_enabled,
         "mic_enabled": _assistant.mic_enabled,
+        "candidate_boxes": {"width": width, "height": height,
+                            "boxes": [{"box": box, "name": name, "score": score, "reason": reason}
+                                      for box, name, score, reason in boxes]}
+        if time.time() < expires and _assistant.camera_enabled and _assistant.recognition_enabled else None,
     })
 
 
@@ -439,7 +445,47 @@ def objects():
         n = len(_assistant.memory.sample_images(o.user_name))
         items.append({"name": o.user_name, "samples": getattr(o, "sample_count", 0),
                       "images": n})
-    return jsonify({"objects": items})
+    cfg = _assistant.cfg.get("memory", {})
+    return jsonify({"objects": items, "min_samples": int(cfg.get("min_samples", 3)),
+                    "max_samples": int(cfg.get("max_samples", 10))})
+
+
+@app.route("/objects/import", methods=["POST"])
+def objects_import():
+    if _assistant is None:
+        return jsonify({"ok": False, "error": "系统尚未就绪。"}), 503
+    if request.content_length and request.content_length > 50 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "图片总大小不能超过 50 MB。"}), 413
+    label = (request.form.get("name") or "").strip()
+    files = request.files.getlist("images")
+    cfg = _assistant.cfg.get("memory", {})
+    minimum, maximum = int(cfg.get("min_samples", 3)), int(cfg.get("max_samples", 10))
+    if not label or len(label) > 80:
+        return jsonify({"ok": False, "error": "请输入不超过80个字符的物体名称。"}), 400
+    if not minimum <= len(files) <= maximum:
+        return jsonify({"ok": False, "error": f"请选择 {minimum} 到 {maximum} 张图片。"}), 400
+    try:
+        with tempfile.TemporaryDirectory(prefix="object-upload-") as temp_dir:
+            paths = []
+            for i, upload in enumerate(files):
+                content = upload.stream.read(10 * 1024 * 1024 + 1)
+                if len(content) > 10 * 1024 * 1024:
+                    return jsonify({"ok": False, "error": "单张图片不能超过 10 MB。"}), 413
+                path = os.path.join(temp_dir, f"{i}.image")
+                with open(path, "wb") as f:
+                    f.write(content)
+                paths.append(path)
+            message = _assistant.enroll_image_files(label, paths)
+        return jsonify({"ok": True, "message": message})
+    except FileExistsError as e:
+        return jsonify({"ok": False, "error": str(e)}), 409
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except RuntimeError as e:
+        return jsonify({"ok": False, "error": str(e)}), 503
+    except Exception:
+        log.exception("Image enrollment failed")
+        return jsonify({"ok": False, "error": "图片录入失败，请检查服务日志。"}), 500
 
 
 @app.route("/objects/sample")

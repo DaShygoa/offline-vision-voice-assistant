@@ -161,6 +161,7 @@ def prepare_resnet18() -> str:
             print(f"[ok ] {onnx_path} ({os.path.getsize(onnx_path)} bytes)")
         except Exception as e:
             print(f"[err] ResNet18 torch export failed: {e}")
+            print("      Install the export dependencies: python -m pip install -r requirements.txt")
             print(
                 "      Manual: place ResNet18 ONNX (input 1x3x224x224 → feature 1x512) at:\n"
                 f"      {onnx_path}"
@@ -218,7 +219,10 @@ def prepare_asr() -> str:
     asr_dir = os.path.join(MODELS, "sherpa-onnx-paraformer-zh-int8")
     os.makedirs(asr_dir, exist_ok=True)
     tokens = os.path.join(asr_dir, "tokens.txt")
-    if os.path.isfile(tokens):
+    if os.path.isfile(tokens) and (os.path.isfile(os.path.join(asr_dir, "model.int8.onnx")) or
+                                   os.path.isfile(os.path.join(asr_dir, "model.onnx")) or
+                                   (os.path.isfile(os.path.join(asr_dir, "encoder.int8.onnx")) and
+                                    os.path.isfile(os.path.join(asr_dir, "decoder.int8.onnx")))):
         print(f"[skip] {asr_dir}")
         _prepare_vad()
         return asr_dir
@@ -266,7 +270,7 @@ def _alias_int8(asr_dir: str, extracted_dir: str | None = None) -> None:
     dec = next((f for f in files if f in ("decoder.onnx",)), None)
     if enc_int8 and enc_int8 != "model.int8.onnx":
         shutil.copy2(os.path.join(asr_dir, enc_int8), os.path.join(asr_dir, "model.int8.onnx"))
-    elif enc:
+    elif not enc_int8 and enc:
         shutil.copy2(os.path.join(asr_dir, enc), os.path.join(asr_dir, "model.int8.onnx"))
     if dec_int8:
         shutil.copy2(os.path.join(asr_dir, dec_int8), os.path.join(asr_dir, "decoder.int8.onnx"))
@@ -332,6 +336,10 @@ def prepare_tts() -> str:
 
 
 def main(argv=None) -> int:
+    # Legacy Windows consoles may not encode progress symbols or user paths.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     p = argparse.ArgumentParser(description="Prepare the classroom-release models (ResNet18 / Depth / ASR / TTS).")
     p.add_argument("--all", action="store_true", help="prepare all models (default when no flag given)")
     p.add_argument("--resnet18", action="store_true", help="export ImageNet ResNet18 (512-d features)")
@@ -341,15 +349,41 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     do_all = args.all or not any([args.resnet18, args.depth, args.asr, args.tts])
+    failures = []
     if do_all or args.resnet18:
-        prepare_resnet18()
+        if not prepare_resnet18():
+            failures.append("ResNet18 export")
     if do_all or args.depth:
-        prepare_depth()
+        if not prepare_depth():
+            failures.append("depth model download")
     if do_all or args.asr:
         prepare_asr()
     if do_all or args.tts:
         prepare_tts()
-    print("\nModel prep done. Offline TTS is available after downloading its model.")
+    required = []
+    if do_all or args.resnet18:
+        required.append(os.path.join(MODELS, "resnet18", "resnet18.onnx"))
+    if do_all or args.depth:
+        required.append(os.path.join(MODELS, "depth_anything_v2", "depth_anything_v2_vits.onnx"))
+    if do_all or args.asr:
+        asr_dir = os.path.join(MODELS, "sherpa-onnx-paraformer-zh-int8")
+        required.extend([os.path.join(asr_dir, "tokens.txt"), os.path.join(MODELS, "silero_vad", "silero_vad.onnx")])
+        e2e = any(os.path.isfile(os.path.join(asr_dir, f)) for f in ("model.int8.onnx", "model.onnx"))
+        split = all(os.path.isfile(os.path.join(asr_dir, f)) for f in ("encoder.int8.onnx", "decoder.int8.onnx"))
+        if not (e2e or split):
+            required.append(os.path.join(asr_dir, "model.int8.onnx"))
+    if do_all or args.tts:
+        required.extend(os.path.join(MODELS, "sherpa-onnx-vits-zh-ll", f) for f in
+                        ("model.onnx", "tokens.txt", "lexicon.txt", "phone.fst", "date.fst", "number.fst"))
+    missing = [path for path in required if not os.path.isfile(path) or os.path.getsize(path) == 0]
+    if missing or failures:
+        print("\n[err] Model preparation incomplete; missing or empty files:")
+        for failure in failures:
+            print(f"      {failure}")
+        for path in missing:
+            print(f"      {path}")
+        return 1
+    print("\nModel preparation complete.")
     return 0
 
 

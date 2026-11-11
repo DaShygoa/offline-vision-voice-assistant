@@ -49,10 +49,25 @@ class AsrPreparationTests(unittest.TestCase):
             asr = Path(tmp) / "sherpa-onnx-paraformer-zh-int8"
             asr.mkdir()
             (asr / "tokens.txt").write_text("token", encoding="utf-8")
+            (asr / "model.int8.onnx").write_bytes(b"model")
             with patch.object(prepare_models, "MODELS", tmp), \
                  patch.object(prepare_models, "_prepare_vad") as vad:
                 prepare_models.prepare_asr()
             vad.assert_called_once()
+
+    def test_existing_int8_is_not_overwritten_by_float_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "model.int8.onnx").write_bytes(b"int8")
+            (root / "model.onnx").write_bytes(b"float")
+            prepare_models._alias_int8(tmp)
+            self.assertEqual((root / "model.int8.onnx").read_bytes(), b"int8")
+
+    def test_main_reports_missing_model_as_failure(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(prepare_models, "MODELS", tmp), \
+             patch.object(prepare_models, "prepare_resnet18", return_value=""):
+            self.assertEqual(prepare_models.main(["--resnet18"]), 1)
 
 
 if __name__ == "__main__":

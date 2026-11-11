@@ -60,15 +60,26 @@ flowchart TB
 ResNet18 都在按需触发的独立线程上，界面帧率与推理速度解耦。暂停识别时，总开关
 会一并释放摄像头、麦克风、深度推理与 MJPEG 编码这几个主要 CPU 消耗点。
 
-## 快速开始（三条命令）
+## 从零开始安装
 
-在**项目根目录**用 **PowerShell**（建议 Python 3.10 / 3.11）：
+在 **Windows 64 位**安装 Python 3.10 或 3.11 后，在**项目根目录**打开 PowerShell：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+如果使用 Python 3.10，将第一行改为 `py -3.10 -m venv .venv`。后续命令也可以直接使用
+`.\.venv\Scripts\python.exe`，无需激活虚拟环境。依赖文件包含模型首次导出所需的 CPU 版
+PyTorch、torchvision 和 ONNX；这些包安装体积较大。若要激活环境再使用下方的 `python` 命令：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+如果 PowerShell 不允许运行激活脚本，使用 `Set-ExecutionPolicy -Scope Process Bypass` 后重试，
+或者不激活并将下面的 `python` 替换为 `.\.venv\Scripts\python.exe`。
 
 **一次性准备模型**（需联网下载一次，之后运行完全离线）：
 
@@ -83,6 +94,7 @@ python tools/prepare_models.py
 | Depth Anything V2 ONNX | `hf-mirror.com` | `huggingface.co` |
 | Paraformer 中文 ASR 包 | `gh-proxy.com`（备 `ghproxy.net`） | `github.com` |
 | Silero VAD ONNX | `gh-proxy.com`（备 `ghproxy.net`） | `github.com` |
+| 离线中文 TTS | `gh-proxy.com`（备 `ghproxy.net`） | `github.com`（优先） |
 
 可用环境变量覆盖镜像（镜像不可用时也可手动指定）：
 
@@ -98,17 +110,19 @@ $env:RESNET18_WEIGHT_MIRROR = "<你信任的 resnet18-f37072fd.pth 国内地址>
 > 再离线导出。也可自行把该文件放到 `torch.hub.get_dir()/checkpoints/` 下，导出即完全离线。
 > （HuggingFace 上的 `resnet18` 权重键名与 torchvision 不兼容，故不直接作为镜像。）
 
-这会备齐三个运行模型：
+脚本会检查所选模型文件；准备失败时以非零状态退出。需要准备的文件包括：
 
 | 路径 | 用途 |
 | --- | --- |
-| `models/resnet18/resnet18.onnx` | 512 维特征提取（`--resnet18`，需临时安装 torch/torchvision 导出一次） |
+| `models/resnet18/resnet18.onnx` | 512 维特征提取（`--resnet18`，使用已安装的 torch/torchvision 和 ONNX 导出一次） |
 | `models/depth_anything_v2/depth_anything_v2_vits.onnx` | 单目深度 / 零样本定位（`--depth`） |
 | `models/sherpa-onnx-paraformer-zh-int8/` | 中文 ASR（`--asr`） |
 | `models/silero_vad/silero_vad.onnx` | 语音端点检测（`--asr` 一同准备） |
+| `models/sherpa-onnx-vits-zh-ll/` | 离线中文语音（`--tts`） |
 
-> 拷机器演示：把整个 `.venv/` 和 `models/` 目录拷到课堂电脑即可，**运行时不需要网络**。
-> `models/`、`data/` 不入库，新克隆必须重新准备。
+> 拷机器演示：在目标电脑重新创建 `.venv/` 并安装依赖，再复制 `models/`；Python 虚拟环境包含
+> 机器相关路径，不建议直接拷贝。模型准备完成后运行不需要网络。`models/`、`data/` 不入库，
+> 新克隆需要重新准备模型；如需保留物体库，还需复制相应 `data/` 数据。
 
 **启动网页**（默认摄像头索引 0、系统默认麦克风）：
 
@@ -138,6 +152,11 @@ python web/server.py --config config/demo.yaml --port 5001 --camera-index 1 --mi
 4. 举起已录入物体，说「**这是什么？**」或点页面快捷按钮 → 报出名称 + 相似度。
 5. 举起**没录入过**的物体（如碗），说「这是什么」→ 应判为「未知物体」。
 6. 说「**你记住了什么**」列出物体库；「**忘掉手机**」删除；右上角按钮可暂停/恢复识别。
+
+摄像头画面右上角的「显示候选框」默认关闭。开启后，每次触发“这是什么”会用蓝框显示
+本次定位得到的候选区域（最多 4 个，包含被筛除的区域），显示最相似物品及分数或过滤原因，
+持续约 4 秒；绿色框仍表示最终结果。候选名称和分数不代表已经通过识别阈值。
+候选框对应识别时的画面，并不是持续跟踪，移动物体后需重新识别。
 
 网页可随时开关摄像头、麦克风、识别流水线；不方便说话时用底部文字输入框，效果一致。
 

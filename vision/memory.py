@@ -263,6 +263,7 @@ class VisualMemory:
         generic_class: Optional[str],
         embeddings: Sequence[np.ndarray],
         sample_images_paths: Sequence[str],
+        replace_existing: bool = True,
     ) -> MemoryObject:
         """Create (or replace) object with N ResNet18 view embeddings."""
         if not embeddings:
@@ -272,6 +273,8 @@ class VisualMemory:
             cur = self._conn.cursor()
             cur.execute("SELECT id FROM objects WHERE user_name = ?", (user_name,))
             row = cur.fetchone()
+            if row and not replace_existing:
+                raise FileExistsError(f"object already exists: {user_name}")
             if row:
                 oid = int(row["id"])
                 cur.execute(
