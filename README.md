@@ -24,7 +24,7 @@ flowchart TB
     end
     subgraph ALGO["算法层"]
         V["vision/<br/>深度定位 · ResNet18 特征<br/>余弦检索 · 裁剪 · 摄像头"]
-        A["voice/<br/>Silero VAD · Paraformer ASR<br/>Edge / mock TTS"]
+        A["voice/<br/>Silero VAD · Paraformer ASR<br/>离线 TTS / Edge TTS"]
         N["nlu/<br/>中文规则意图解析"]
     end
     subgraph MEM["存储层"]
@@ -70,11 +70,33 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-**一次性准备模型**（需联网下载，之后运行完全离线）：
+**一次性准备模型**（需联网下载一次，之后运行完全离线）：
 
 ```powershell
 python tools/prepare_models.py
 ```
+
+脚本默认走**国内镜像**，且每个文件都带「镜像失败自动回退官方源」的兜底，单个镜像挂掉不会卡住部署：
+
+| 模型文件 | 国内镜像 | 官方兜底 |
+| --- | --- | --- |
+| Depth Anything V2 ONNX | `hf-mirror.com` | `huggingface.co` |
+| Paraformer 中文 ASR 包 | `gh-proxy.com`（备 `ghproxy.net`） | `github.com` |
+| Silero VAD ONNX | `gh-proxy.com`（备 `ghproxy.net`） | `github.com` |
+
+可用环境变量覆盖镜像（镜像不可用时也可手动指定）：
+
+```powershell
+$env:HF_ENDPOINT = "https://hf-mirror.com"          # HuggingFace 镜像端点
+$env:GH_PROXY = "https://gh-proxy.com/"              # GitHub Release 代理
+$env:RESNET18_WEIGHT_MIRROR = "<你信任的 resnet18-f37072fd.pth 国内地址>"  # 可选，见下
+```
+
+> **ResNet18 权重说明**：`--resnet18` 需要 ImageNet 预训练权重 `resnet18-f37072fd.pth`。
+> torchvision 默认从 `download.pytorch.org` 拉取；若部署机无法访问，设置
+> `RESNET18_WEIGHT_MIRROR` 指向你有权限访问的同名权重地址，脚本会先下到 torch 缓存
+> 再离线导出。也可自行把该文件放到 `torch.hub.get_dir()/checkpoints/` 下，导出即完全离线。
+> （HuggingFace 上的 `resnet18` 权重键名与 torchvision 不兼容，故不直接作为镜像。）
 
 这会备齐三个运行模型：
 
@@ -88,7 +110,7 @@ python tools/prepare_models.py
 > 拷机器演示：把整个 `.venv/` 和 `models/` 目录拷到课堂电脑即可，**运行时不需要网络**。
 > `models/`、`data/` 不入库，新克隆必须重新准备。
 
-**启动网页**（默认摄像头索引 0）：
+**启动网页**（默认摄像头索引 0、系统默认麦克风）：
 
 ```powershell
 python web/server.py --config config/demo.yaml
@@ -101,9 +123,12 @@ python web/server.py --config config/demo.yaml
 python web/server.py --config config/demo.yaml --no-camera --no-mic
 # 不用语音输入，仅网页文字输入
 python web/server.py --config config/demo.yaml --no-voice
-# 换端口 / 换摄像头
-python web/server.py --config config/demo.yaml --port 5001
+# 换端口 / 指定初始设备（也可在网页「设备设置」里随时切换）
+python web/server.py --config config/demo.yaml --port 5001 --camera-index 1 --mic-device 8
 ```
+
+`--mic-device` 可填 sounddevice 的设备索引或名称；`config/demo.yaml` 中的
+`app.camera_index` / `asr.mic_device` 是对应默认值，网页上的选择即时生效、无需重启。
 
 ## 课堂演示话术（建议提前彩排）
 
@@ -115,6 +140,15 @@ python web/server.py --config config/demo.yaml --port 5001
 6. 说「**你记住了什么**」列出物体库；「**忘掉手机**」删除；右上角按钮可暂停/恢复识别。
 
 网页可随时开关摄像头、麦克风、识别流水线；不方便说话时用底部文字输入框，效果一致。
+
+点击右上角「**设备设置**」可枚举本机摄像头与麦克风并即时切换：摄像头列表来自 Windows
+**DirectShow 设备枚举**（显示 `Integrated Camera` 这类真实名称 + OpenCV 索引），枚举本身不打开
+设备，因此主摄像头占用 / 虚拟摄像头未启动时设备也不会从列表里消失，只标注「不可用」；
+OpenCV 探测只补充分辨率与当前能否打开。弹窗里是 **MJPEG 实时预览**（不是静态截图），
+切换下拉即可看到对应设备的动态画面；
+麦克风默认按名称跨驱动去重（优先 WASAPI，只出现于 WDM-KS 的耳机麦克风也保留），
+自动合并别名 / 回环项，勾选「显示全部驱动设备」可查看完整列表。切换时服务端会重新打开设备，画面 / 语音短暂中断
+属正常现象；设备来自**运行服务的这台电脑**，与浏览器权限无关。
 
 | 意图 | 示例说法 |
 | --- | --- |
@@ -150,7 +184,7 @@ flowchart LR
     I[麦克风 → VAD → Paraformer] --> J[规则意图解析]
     K[网页文字输入] --> J
     J --> G
-    G --> L[Edge TTS / mock 提示音]
+    G --> L[离线中文语音 / Edge TTS]
 ```
 
 定位与身份分离：深度模型只回答「剪哪一块」，名称完全来自特征库检索。
@@ -167,7 +201,7 @@ flowchart LR
 | `memory.min_samples` / `max_samples` | `3` / `10` | 一次录入的样本数上下限 |
 | `depth.enabled` | `true` | 深度零样本定位；关掉则回退画面中心 45% |
 | `debug.enabled` | `false` | 默认不落盘画面，避免存入课堂参与者肖像 |
-| `tts.mode` | `edge` | 在线语音；断网自动降级为 `mock` 提示音 |
+| `tts.mode` | `offline` | 本地中文语音；首次运行 `python tools/prepare_models.py --tts` 下载模型。设为 `edge` 可使用在线语音，失败时回退到离线语音 |
 
 > **0.5 是针对当前演示的拒识设置，不是通用最优阈值**。换物体集合后边界会变，
 > 可据现场效果微调；只有已录入物体 ≥2 个时才启用中心化阈值。
@@ -178,11 +212,10 @@ flowchart LR
 | --- | --- |
 | 视觉定位 / 特征提取 / 特征检索 | 否，ONNX Runtime CPU 本地推理 |
 | 中文 ASR / VAD / 意图解析 | 否，sherpa-onnx + 纯规则 |
-| 语音播报（默认 `edge`） | **是**，微软 Edge TTS 在线合成 |
-| 断网时播报 | 自动降级为 `mock` 本地提示音，识别功能不受影响 |
+| 语音播报（默认 `offline`） | 否，sherpa-onnx 在本地合成中文语音 |
+| 可选 `edge` 模式 | 是，在线失败时使用本地中文语音 |
 
-如需**完全离线且要真人声音**，需另外自行部署 GPT-SoVITS（本分支已移除其集成，
-保留 `master` 分支可作参考）。只想纯视觉演示时设 `tts.enabled: false` 即可。
+离线语音模型需要首次联网下载；之后合成不需要网络。只想纯视觉演示时设 `tts.enabled: false` 即可。
 
 ## 数据存储
 
@@ -207,9 +240,10 @@ python tools/test_depth_localization.py --image data/test_scenes/cup_scene_00.jp
 
 - **页面打不开**：确认终端无报错、端口未占用，访问 `127.0.0.1:5000` 而非 `localhost`（本机代理可能拦截）。
 - **模型未加载**：检查 `models/` 下文件与 `prepare_models.py` 输出；提示跑 `--resnet18` 就是特征模型缺失。
-- **摄像头无画面**：检查权限/索引/占用，或在网页重新开启；也可 `--no-camera` 启动后用本地图片演示。
+- **摄像头无画面**：检查权限/索引/占用，或在网页「设备设置」里换索引并看实时预览；也可 `--no-camera` 启动后用本地图片演示。候选设备的实时预览打不开通常是被主摄像头独占（DirectShow 同一设备只能开一次），此时直接点「应用切换」，左侧主画面就是新设备的实时画面；不合适再切回来。
+- **麦克风选错 / 没声音**：在网页「设备设置」里按真实名称重选输入设备（WASAPI 项通常最稳）；切换失败会自动回滚到原设备。
 - **已录入物体显示未知**：检查录入样本与当前裁剪；严重遮挡、透视变化或定位截断无法靠阈值解决。
-- **没有语音播报**：检查网络（edge 模式）。断网时应听到 mock 提示音；视觉识别始终可用。
+- **没有语音播报**：检查输出设备、日志及离线模型文件；缺失时运行 `python tools/prepare_models.py --tts`。
 
 ## 项目结构
 
@@ -218,8 +252,9 @@ web/server.py             Flask 服务：MJPEG 视频流、深度图、状态与
 web/templates/index.html  浏览器界面
 core/app.py               AssistantApp：线程编排、意图分发、识别/录入、降级
 core/config.py            YAML 配置加载 + CLI/环境变量覆盖
+core/devices.py           DirectShow 摄像头名称枚举 / 扫描 / MJPEG 预览、麦克风去重
 vision/                   深度定位、ResNet18 特征提取、检索、裁剪、摄像头
-voice/                    ASR、VAD、麦克风、TTS（edge + mock）
+voice/                    ASR、VAD、麦克风、TTS（离线中文语音 + 可选 Edge）
 nlu/intent.py             中文规则意图解析
 config/demo.yaml          唯一配置文件（课堂展示默认）
 tools/                    模型准备、回归测试、冒烟、深度定位测试

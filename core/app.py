@@ -136,6 +136,12 @@ class AssistantApp:
         self.vad = Vad(cfg.get("asr", {}))
         self.asr = ParaformerASR(cfg.get("asr", {}))
         self.mic = MicStream(sample_rate=int(cfg.get("asr", {}).get("sample_rate", 16000)))
+        # None = system default input; an int index or a name substring otherwise.
+        # The web settings panel can change this at runtime.
+        self.mic.device = cfg.get("asr", {}).get("mic_device", None)
+        if self.mic.device is not None:
+            from core import devices as _dev
+            self.mic.device_name = _dev.mic_name(self.mic.device)
 
         self._intent_q: "queue.Queue[Intent]" = queue.Queue(maxsize=8)
         self._running = False
@@ -331,7 +337,7 @@ class AssistantApp:
             log.warning("intent queue full, dropping")
 
     def inject_text(self, text: str) -> None:
-        self.push_chat("user", text)
+        self.push_chat("user", text, source="text")
         intent = parse_intent(text)
         self.stats.last_intent = f"{intent.type.value}:{intent.label or '-'}"
         self._set_subtitle(f"你：{text}", 3.0)
@@ -437,7 +443,7 @@ class AssistantApp:
         return np.ascontiguousarray(rotated[y:y + rh, x:x + rw])
 
     def _match_crop(self, crop: np.ndarray, foreground_mask: Optional[np.ndarray] = None):
-        """Match a crop; retry quarter turns if the original view is uncertain.
+        """Match a crop; retry rotated views if the original is uncertain.
 
         ResNet18 isn't rotation invariant. Rotating the query preserves existing
         enrollment features and the calibrated score/margin checks.
@@ -445,14 +451,24 @@ class AssistantApp:
         best_emb, best = None, None
         views = [crop if turns == 0 else np.ascontiguousarray(np.rot90(crop, turns))
                  for turns in range(4)]
-        for index in range(8):
-            if index == 4:
-                straight = self._deskew_crop(crop, foreground_mask)
-                if straight is None:
-                    break
-                views.extend(straight if turns == 0 else np.ascontiguousarray(np.rot90(straight, turns))
-                             for turns in range(4))
-            view = views[index]
+        def rotated_views():
+            yield from views
+            straight = self._deskew_crop(crop, foreground_mask)
+            if straight is not None:
+                yield from (straight if turns == 0 else np.ascontiguousarray(np.rot90(straight, turns))
+                            for turns in range(4))
+            # Cover the midpoint between quarter turns even for roughly square
+            # objects, where a foreground silhouette cannot determine an axis.
+            h, w = crop.shape[:2]
+            matrix = cv2.getRotationMatrix2D((w / 2, h / 2), 45, 1.0)
+            side = int(np.ceil(np.hypot(w, h)))
+            matrix[0, 2] += (side - w) / 2
+            matrix[1, 2] += (side - h) / 2
+            diagonal = cv2.warpAffine(crop, matrix, (side, side), borderMode=cv2.BORDER_REPLICATE)
+            yield from (diagonal if turns == 0 else np.ascontiguousarray(np.rot90(diagonal, turns))
+                        for turns in range(4))
+
+        for view in rotated_views():
             emb = self._embed_crop(view)
             if emb is None:
                 continue
@@ -1022,10 +1038,10 @@ class AssistantApp:
         self._last_subtitle = text
         self._subtitle_until = time.time() + seconds
 
-    def push_chat(self, role: str, text: str) -> None:
+    def push_chat(self, role: str, text: str, source: str = "") -> None:
         """Append a message to the chat history (user/bot/sys) for web UI."""
         with self._chat_lock:
-            self._chat_log.append({"role": role, "text": text, "ts": time.time()})
+            self._chat_log.append({"role": role, "text": text, "ts": time.time(), "source": source})
             if len(self._chat_log) > 100:
                 self._chat_log = self._chat_log[-100:]
 
@@ -1110,6 +1126,110 @@ class AssistantApp:
         self.stats.mic_enabled = self._mic_enabled
         log.info("Microphone %s", "started" if self._mic_enabled else "released")
         return self._mic_enabled
+
+    # ------------------------------------------------------- device switching
+    def set_camera_device(self, index: int) -> bool:
+        """Hot-switch the camera index, preserving the on/off state.
+
+        ``Camera.reopen`` restores the previous device on failure, so a bad
+        selection leaves the running capture pipeline untouched.
+        """
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return False
+        if index < 0:
+            return False
+        with self._resource_lock:
+            if index == self.camera.index:
+                return True
+            try:
+                self.camera.reopen(index)
+            except Exception as e:
+                log.warning("camera switch to %s failed: %s", index, e)
+                return False
+            # While the camera is released reopen() does not touch the device;
+            # that is intentional — DSHOW probes are flaky (a busy driver can
+            # refuse an otherwise valid index), and the picker only offers
+            # indexes that came from a successful scan. Enabling the camera
+            # later performs the real open() and reports a failure.
+            self.cfg.setdefault("app", {})["camera_index"] = index
+        log.info("Camera device -> index %s", index)
+        return True
+
+    def set_mic_device(self, device) -> bool:
+        """Hot-switch the input device, preserving the on/off state.
+
+        The voice worker keeps running: it only reads from the queue, so a
+        stop -> change device -> start cycle needs no thread coordination.
+        """
+        old = self.mic.device
+        if str(device) == str(old):
+            return True
+        with self._resource_lock:
+            was_on = self._mic_enabled and self.use_voice
+            self.mic.stop()
+            self.mic.flush()
+            self.mic.device = device
+            ok = True
+            if was_on:
+                try:
+                    if not self.asr.ready:
+                        self.asr.load()
+                        self.vad.load()
+                    alive = any(t.name == "voice" and t.is_alive() for t in self._threads)
+                    if alive:
+                        ok = self.mic.start(device)
+                    else:
+                        # A worker that died earlier (e.g. --no-mic startup)
+                        # opens the stream itself; give it a moment to come up.
+                        t = threading.Thread(target=self._voice_loop, name="voice", daemon=True)
+                        t.start()
+                        self._threads.append(t)
+                        for _ in range(12):
+                            if self.mic.available:
+                                break
+                            time.sleep(0.05)
+                        ok = self.mic.available
+                except Exception as e:
+                    log.warning("mic switch to %s failed: %s", device, e)
+                    ok = False
+            if not ok:
+                self.mic.device = old
+                if was_on:
+                    try:
+                        self.mic.start(old)
+                    except Exception as e:
+                        log.warning("failed to restore mic %s: %s", old, e)
+                return False
+            self.cfg.setdefault("asr", {})["mic_device"] = device
+            from core import devices as _dev
+            self.mic.device_name = _dev.mic_name(device)
+        log.info("Mic device -> %s", device if device is not None else "system default")
+        return True
+
+    @property
+    def current_devices(self) -> dict:
+        """Labels for /status and the device picker."""
+        mic = self.mic.device
+        if mic is None:
+            mic_label = "系统默认输入设备"
+        elif isinstance(mic, int):
+            mic_label = self.mic.device_name or f"输入设备 {mic}"
+        else:
+            mic_label = str(mic)
+        # DirectShow friendly name when available, else the plain index label.
+        from core import devices as _dev
+        name = _dev.camera_name(self.camera.index)
+        camera_label = (f"{name}（索引 {self.camera.index}）"
+                        if name != f"摄像头 {self.camera.index}"
+                        else name)
+        return {
+            "camera_index": self.camera.index,
+            "camera_label": camera_label,
+            "mic_device": mic,
+            "mic_label": mic_label,
+        }
 
     def set_recognition_enabled(self, enabled: bool) -> bool:
         """Master switch. Pausing frees the heavy resources (depth inference,

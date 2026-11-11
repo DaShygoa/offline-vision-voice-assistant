@@ -113,7 +113,19 @@ class OrientationTests(unittest.TestCase):
     def test_unknown_stays_below_threshold_after_all_turns(self):
         _, match = self.app._match_crop(np.zeros_like(self.upright))
         self.assertLess(match.score, self.app.memory.threshold)
-        self.assertEqual(self.calls, 4)
+        self.assertEqual(self.calls, 8)
+
+    def test_diagonal_retry_for_square_object_without_a_mask(self):
+        crop = np.zeros((60, 60, 3), np.uint8)
+        def embed(view):
+            self.calls += 1
+            # The diagonal retries use an expanded canvas; quarter turns do not.
+            return np.array([1, 0, 0, 0] if view.shape[0] > 60 else [0, 0, 1, 0], np.float32)
+        self.app._embed_crop = embed
+        _, match = self.app._match_crop(crop)
+        self.assertEqual(match.user_name, "mouse")
+        self.assertGreaterEqual(match.score, self.app.memory.threshold)
+        self.assertEqual(self.calls, 5)
 
     def test_extraction_failures_return_no_match(self):
         self.app._embed_crop = lambda crop: None

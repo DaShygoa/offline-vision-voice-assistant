@@ -28,6 +28,44 @@
   .dev-chip.off { color:#64748b; }
   .dev-chip.off .dot { background:#64748b; }
   .dev-chip:hover { border-color:#4f46e5; color:#c7d2fe; }
+  .dev-btn { background:#252836; color:#94a3b8; border:1px solid #2a2d3a; border-radius:6px; padding:4px 10px; font-size:11px; cursor:pointer; display:flex; align-items:center; gap:5px; font-family:inherit; white-space:nowrap; }
+  .dev-btn:hover { border-color:#4f46e5; color:#c7d2fe; }
+  .dev-btn svg { flex-shrink:0; }
+
+  /* ── device picker modal ── */
+  .modal-backdrop { position:fixed; inset:0; background:rgba(6,8,14,.74); z-index:60; display:none; align-items:center; justify-content:center; padding:24px; }
+  .modal-backdrop.show { display:flex; }
+  .modal { width:540px; max-width:100%; max-height:100%; overflow-y:auto; background:#1a1d27; border:1px solid #343a4d; border-radius:14px; box-shadow:0 24px 70px rgba(0,0,0,.6); padding:20px 22px 18px; }
+  .modal::-webkit-scrollbar { width:6px; } .modal::-webkit-scrollbar-thumb { background:#2a2d3a; border-radius:3px; }
+  .modal-head { display:flex; align-items:center; justify-content:space-between; }
+  .modal-head h2 { font-size:16px; font-weight:600; }
+  .modal-close { background:transparent; border:none; color:#94a3b8; font-size:22px; line-height:1; cursor:pointer; padding:0 4px; font-family:inherit; }
+  .modal-close:hover { color:#fff; }
+  .modal-note { font-size:11px; color:#64748b; line-height:1.65; margin:8px 0 4px; }
+  .dev-group { border-top:1px solid #262b3a; padding:14px 0 2px; }
+  .dev-group .grp-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:9px; }
+  .dev-group h3 { font-size:12px; color:#cbd5e1; font-weight:600; }
+  .grp-tools { display:flex; align-items:center; gap:10px; }
+  .chk { display:flex; align-items:center; gap:5px; font-size:11px; color:#94a3b8; cursor:pointer; white-space:nowrap; }
+  .chk input { accent-color:#6366f1; cursor:pointer; margin:0; }
+  .mini-btn { background:#252836; color:#a5b4fc; border:1px solid #2a2d3a; border-radius:6px; padding:4px 10px; font-size:11px; cursor:pointer; font-family:inherit; }
+  .mini-btn:hover { border-color:#4f46e5; }
+  .mini-btn:disabled { opacity:.5; cursor:not-allowed; }
+  .dev-select { width:100%; background:#0f1117; color:#e2e8f0; border:1px solid #2a2d3a; border-radius:8px; padding:9px 10px; font-size:12px; font-family:inherit; outline:none; }
+  .dev-select:focus { border-color:#818cf8; }
+  .dev-select option, .dev-select optgroup { background:#0f1117; color:#e2e8f0; }
+  .dev-hint { font-size:11px; color:#64748b; margin-top:7px; line-height:1.55; min-height:15px; }
+  .cam-preview { display:flex; gap:12px; align-items:center; margin-top:10px; }
+  .cam-preview img { width:176px; height:99px; flex-shrink:0; object-fit:cover; background:#000; border:1px solid #2a2d3a; border-radius:8px; }
+  .cam-preview .txt { font-size:11px; color:#64748b; line-height:1.6; }
+  .modal-msg { font-size:11px; margin-top:14px; min-height:16px; line-height:1.5; }
+  .modal-msg.ok { color:#6ee7b7; } .modal-msg.err { color:#fca5a5; } .modal-msg.info { color:#94a3b8; }
+  .modal-foot { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; padding-top:14px; border-top:1px solid #262b3a; }
+  .btn-ghost { background:transparent; color:#94a3b8; border:1px solid #343a4d; border-radius:8px; padding:8px 18px; font-size:12px; cursor:pointer; font-family:inherit; }
+  .btn-ghost:hover { color:#e2e8f0; border-color:#64748b; }
+  .btn-primary { background:#4f46e5; color:#fff; border:none; border-radius:8px; padding:8px 20px; font-size:12px; font-weight:500; cursor:pointer; font-family:inherit; }
+  .btn-primary:hover { background:#6366f1; }
+  .btn-primary:disabled { opacity:.5; cursor:not-allowed; }
 
   /* ── main row: video + right panel ── */
   .main { flex:1; display:flex; overflow:hidden; }
@@ -105,6 +143,9 @@
     <div class="fps-badge" id="fps-badge">-- FPS</div>
     <button class="dev-chip" id="chip-cam" onclick="toggleDevice('camera')" title="开关摄像头"><span class="dot"></span>摄像头</button>
     <button class="dev-chip" id="chip-mic" onclick="toggleDevice('mic')" title="开关麦克风"><span class="dot"></span>麦克风</button>
+    <button class="dev-btn" id="dev-btn" onclick="openDeviceModal()" title="选择摄像头 / 麦克风设备">
+      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>设备设置
+    </button>
     <button class="recog-btn" id="recog-btn" onclick="toggleRecognition()">暂停识别</button>
   </div>
 </div>
@@ -157,6 +198,48 @@
   </div>
 </div>
 
+<!-- ═══ device picker modal ═══ -->
+<div class="modal-backdrop" id="dev-modal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dev-title">
+    <div class="modal-head">
+      <h2 id="dev-title">设备设置</h2>
+      <button class="modal-close" onclick="closeDeviceModal()" title="关闭">&times;</button>
+    </div>
+    <div class="modal-note">设备来自运行本服务的电脑（不是浏览器）。切换后服务端会重新打开设备，画面 / 语音短暂中断属于正常现象。</div>
+
+    <div class="dev-group">
+      <div class="grp-head">
+        <h3>摄像头</h3>
+        <button class="mini-btn" id="cam-refresh" onclick="refreshDevices()">重新扫描</button>
+      </div>
+      <select class="dev-select" id="cam-select" onchange="onCamSelect()"></select>
+      <div class="dev-hint" id="cam-hint">正在读取设备…</div>
+      <div class="cam-preview">
+        <img id="cam-preview-img" alt="摄像头实时预览">
+        <div class="txt" id="cam-preview-txt">选择摄像头后可查看实时画面，用来区分不同的设备索引。</div>
+      </div>
+    </div>
+
+    <div class="dev-group">
+      <div class="grp-head">
+        <h3>麦克风</h3>
+        <div class="grp-tools">
+          <label class="chk"><input type="checkbox" id="mic-all" onchange="onMicAllChange()">显示全部驱动设备</label>
+          <button class="mini-btn" id="mic-refresh" onclick="refreshDevices()">重新扫描</button>
+        </div>
+      </div>
+      <select class="dev-select" id="mic-select" onchange="onMicSelect()"></select>
+      <div class="dev-hint" id="mic-hint">正在读取设备…</div>
+    </div>
+
+    <div class="modal-msg" id="dev-msg"></div>
+    <div class="modal-foot">
+      <button class="btn-ghost" onclick="closeDeviceModal()">取消</button>
+      <button class="btn-primary" id="dev-apply" onclick="applyDevices()">应用切换</button>
+    </div>
+  </div>
+</div>
+
 <script>
 function addMsg(type, text, tag) {
   const el = document.getElementById('chat-messages');
@@ -190,7 +273,7 @@ async function pollChat() {
       for (const m of data.messages) {
         if (m.role === 'user') {
           hideLoading();
-          addMsg('user', m.text, '语音');
+          addMsg('user', m.text, m.source === 'text' ? '你' : '语音');
           showLoading('正在识别…');
         } else if (m.role === 'bot') {
           hideLoading();
@@ -212,11 +295,11 @@ async function sendCmd() {
   if (!text) return;
   input.value = '';
   input.placeholder = '输入指令… 如：这是什么？';
-  addMsg('user', text, '你');
   showLoading('正在识别…');
   try {
-    await fetch('/command', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
-  } catch(e) { hideLoading(); }
+    const res = await fetch('/command', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
+    if (!res.ok) throw new Error('command failed');
+  } catch(e) { hideLoading(); addMsg('sys', '发送失败，请重试'); }
 }
 
 function quickCmd(text) {
@@ -347,6 +430,8 @@ async function pollStatus() {
       syncRecognitionBtn(s.recognition_enabled !== false);
       syncDeviceChip('chip-cam', s.camera_enabled !== false);
       syncDeviceChip('chip-mic', s.mic_enabled !== false);
+      document.getElementById('chip-cam').title = '开关摄像头 · 当前：' + (s.camera_label || ('索引 ' + s.camera_index));
+      document.getElementById('chip-mic').title = '开关麦克风 · 当前：' + (s.mic_label || '系统默认');
       document.getElementById('s-resnet').textContent = s.resnet18==='off'?'OFF':'CPU';
       document.getElementById('s-depth').textContent = s.depth==='off'?'OFF':'CPU';
       document.getElementById('s-mem').textContent = s.mem_objects;
@@ -362,6 +447,212 @@ async function pollStatus() {
   } catch(e) {}
   setTimeout(pollStatus, 500);
 }
+// ═══════════════════ device picker ═══════════════════
+let devOpen = false, devData = null, devReq = 0, devPoll = null, devPreviewDone = false;
+let previewSeq = 0;
+let devChoice = {camera: undefined, mic: undefined};
+
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[c]));
+}
+function setDevMsg(text, kind) {
+  const el = document.getElementById('dev-msg');
+  el.textContent = text || '';
+  el.className = 'modal-msg' + (kind ? ' ' + kind : '');
+}
+function micValOf(v) { return (v === null || v === undefined || v === '') ? '' : String(v); }
+
+function openDeviceModal() {
+  devOpen = true; devReq++;
+  devChoice = {camera: undefined, mic: undefined};
+  devPreviewDone = false;
+  document.getElementById('dev-modal').classList.add('show');
+  setDevMsg('', '');
+  loadDevices(true);
+}
+function closeDeviceModal() {
+  devOpen = false; devReq++;
+  if (devPoll) { clearTimeout(devPoll); devPoll = null; }
+  stopCamPreview();
+  document.getElementById('dev-modal').classList.remove('show');
+}
+
+// Free the preview capture on the server: DirectShow devices are exclusive,
+// so leaving a stream open would block the next camera switch.
+function stopCamPreview() {
+  document.getElementById('cam-preview-img').removeAttribute('src');
+  fetch('/devices/preview/stop', {method:'POST'}).catch(()=>{});
+}
+function onMicAllChange() { loadDevices(false); }
+
+// A rescan opens every camera index; release the preview capture first so it
+// does not compete with the probe, then reconnect once the scan is done.
+function refreshDevices() {
+  stopCamPreview();
+  devPreviewDone = false;
+  loadDevices(true);
+}
+
+async function loadDevices(refresh) {
+  const myReq = ++devReq;
+  try {
+    const params = new URLSearchParams();
+    if (refresh) params.set('refresh', '1');
+    if (document.getElementById('mic-all').checked) params.set('all_mics', '1');
+    const qs = params.toString();
+    const res = await fetch('/devices' + (qs ? '?' + qs : ''));
+    const d = await res.json();
+    if (!devOpen || myReq !== devReq) return;   // modal closed / newer request
+    devData = d;
+    renderDevices(d);
+    const ci = d.camera_info || {};
+    let camHint = d.scanning ? '正在扫描摄像头（逐个打开约需数秒）…'
+       : (d.cameras.length
+            ? '检测到 ' + d.cameras.length + ' 个摄像头 · ' + (ci.named ? '名称来自 DirectShow 设备枚举' : '按 OpenCV 索引排列')
+            : '未检测到可用摄像头');
+    if (!d.scanning && ci.unavailable) {
+      camHint += ' · ' + ci.unavailable + ' 个设备当前打不开（被占用 / 未启动），仍保留在列表中';
+    }
+    if (d.scan_error) camHint += ' · ' + d.scan_error;
+    document.getElementById('cam-hint').textContent = camHint;
+    const mi = d.mic_info || {};
+    document.getElementById('mic-hint').textContent = d.microphones.length
+      ? (mi.compact
+          ? '显示 ' + d.microphones.length + ' 个麦克风 · 已跨驱动合并 ' + (mi.hidden || 0) + ' 个重复 / 别名项（优先 ' + (mi.preferred_host || '首选驱动') + '）'
+          : '显示全部 ' + d.microphones.length + ' 个输入设备（含各驱动的重复项）')
+      : '未检测到输入设备（可检查系统录音权限）';
+    document.getElementById('cam-refresh').disabled = !!d.scanning;
+    document.getElementById('mic-refresh').disabled = !!d.scanning;
+    if (d.scanning) {
+      devPoll = setTimeout(() => loadDevices(false), 700);
+    } else {
+      devPoll = null;
+      if (!devPreviewDone) { devPreviewDone = true; updateCamPreview(); }
+    }
+  } catch(e) {
+    if (devOpen) setDevMsg('读取设备列表失败：' + e.message, 'err');
+  }
+}
+
+function renderDevices(d) {
+  const camSel = document.getElementById('cam-select');
+  const micSel = document.getElementById('mic-select');
+  const curCam = String(d.camera_index ?? 0);
+  const curMic = micValOf(d.mic_device);
+  if (devChoice.camera === undefined) devChoice.camera = curCam;
+  if (devChoice.mic === undefined) devChoice.mic = curMic;
+
+  const cams = (d.cameras || []).slice().sort((a,b) => Number(a.id) - Number(b.id));
+  if (!cams.some(c => String(c.id) === curCam)) {
+    cams.unshift({id: Number(curCam), name: '摄像头 ' + curCam, detail: '当前设备', in_use: true});
+  }
+  camSel.innerHTML = cams.map(c =>
+    `<option value="${escHtml(c.id)}">${escHtml(c.name)}${c.detail ? ' · ' + escHtml(c.detail) : ''}${c.in_use ? '（当前）' : ''}${c.available === false ? '（不可用）' : (c.readable === false ? '（无画面）' : '')}</option>`
+  ).join('') || '<option value="">未检测到摄像头</option>';
+  if ([...camSel.options].some(o => o.value === String(devChoice.camera))) camSel.value = String(devChoice.camera);
+
+  // Compact view usually contains a single host API, so only add optgroups
+  // when "显示全部驱动设备" is on and several APIs are present.
+  const mics = d.microphones || [];
+  const opt = m => `<option value="${escHtml(m.id)}">${escHtml(m.name)}${m.detail ? ' · ' + escHtml(m.detail) : ''}${m.is_alias ? '（别名/回环）' : ''}${m.is_default ? '（系统默认）' : ''}${m.is_current ? '（当前）' : ''}</option>`;
+  let html = `<option value="">系统默认输入设备${curMic === '' ? '（当前）' : ''}</option>`;
+  const hosts = [...new Set(mics.map(m => m.host || '其他'))];
+  if (hosts.length > 1) {
+    for (const host of hosts) {
+      html += `<optgroup label="${escHtml(host)}">` +
+        mics.filter(m => (m.host || '其他') === host).map(opt).join('') + '</optgroup>';
+    }
+  } else {
+    html += mics.map(opt).join('');
+  }
+  if (curMic !== '' && !mics.some(m => String(m.id) === curMic)) {
+    html += `<option value="${escHtml(curMic)}">${escHtml(d.mic_label || ('设备 ' + curMic))}（当前）</option>`;
+  }
+  micSel.innerHTML = html;
+  if ([...micSel.options].some(o => o.value === devChoice.mic)) micSel.value = devChoice.mic;
+}
+
+function onCamSelect() {
+  devChoice.camera = document.getElementById('cam-select').value;
+  updateCamPreview();
+}
+function onMicSelect() { devChoice.mic = document.getElementById('mic-select').value; }
+
+function updateCamPreview() {
+  const idx = document.getElementById('cam-select').value;
+  const img = document.getElementById('cam-preview-img');
+  const txt = document.getElementById('cam-preview-txt');
+  if (idx === '') { stopCamPreview(); txt.textContent = '未选择摄像头。'; return; }
+  const seq = ++previewSeq;
+  txt.textContent = '正在连接实时预览…';
+  img.style.opacity = '0.35';
+  img.onload = () => {
+    if (seq !== previewSeq) return;
+    img.style.opacity = '1';
+    txt.textContent = '摄像头 ' + idx + ' 的实时画面；点「应用切换」后左侧主画面会切过去。';
+  };
+  img.onerror = () => {
+    if (seq !== previewSeq) return;
+    img.style.opacity = '0.12';
+    txt.textContent = '该设备当前无法实时预览（多半被主摄像头占用）。可直接点「应用切换」，左侧主画面会实时显示新设备；不合适再切回来。';
+  };
+  // MJPEG: the browser keeps the connection open and repaints every frame.
+  img.src = '/devices/preview/stream?index=' + encodeURIComponent(idx) + '&t=' + Date.now();
+}
+
+async function applyDevices() {
+  if (!devData) { setDevMsg('设备信息尚未加载完成，请稍候。', 'info'); return; }
+  const camVal = document.getElementById('cam-select').value;
+  const micVal = document.getElementById('mic-select').value;
+  const curCam = String(devData.camera_index ?? 0);
+  const curMic = micValOf(devData.mic_device);
+  const payload = {};
+  if (camVal !== '' && camVal !== curCam) payload.camera = Number(camVal);
+  if (micVal !== curMic) {
+    payload.mic = micVal === '' ? null : (Number.isNaN(Number(micVal)) ? micVal : Number(micVal));
+  }
+  if (!Object.keys(payload).length) { setDevMsg('设备未变化，无需切换。', 'info'); return; }
+
+  const btn = document.getElementById('dev-apply');
+  btn.disabled = true;
+  setDevMsg('正在切换设备，画面 / 语音会短暂中断…', 'info');
+  try {
+    const res = await fetch('/devices', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+    });
+    const d = await res.json();
+    devData = Object.assign({}, devData, d);
+    if (d.ok) {
+      const parts = [];
+      if ('camera' in payload) parts.push('摄像头 → ' + (d.camera_label || payload.camera));
+      if ('mic' in payload) parts.push('麦克风 → ' + (d.mic_label || '系统默认'));
+      const msg = parts.join('；');
+      setDevMsg('已切换：' + msg, 'ok');
+      addMsg('sys', '设备已切换：' + msg);
+      syncDeviceChip('chip-cam', !!d.camera_enabled);
+      syncDeviceChip('chip-mic', !!d.mic_enabled);
+      updateCamPreview();
+      loadDevices(true);   // rescan so the "（当前）" marker follows the new device
+    } else {
+      const errs = Object.values(d.errors || {});
+      setDevMsg(errs.length ? errs.join('；') : '切换失败，请重试。', 'err');
+    }
+  } catch(e) {
+    setDevMsg('切换请求失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('dev-modal').addEventListener('click', e => {
+  if (e.target && e.target.id === 'dev-modal') closeDeviceModal();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && devOpen) closeDeviceModal();
+});
+
 refreshObjects(); pollStatus(); pollChat(); setInterval(refreshObjects, 3000);
 </script>
 </body>

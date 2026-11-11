@@ -15,7 +15,7 @@ sherpa-onnx>=1.10.50
 kaldi-native-fbank>=1.10.40  # Paraformer e2e feature pipeline (LFR + CMVN)
 sounddevice>=0.4.6
 soundfile>=0.12.1
-edge-tts>=7.0                # default TTS; auto-falls back to mock beep when offline
+edge-tts>=7.0                # optional online TTS; offline voice is the default
 
 # Config
 pyyaml>=6.0

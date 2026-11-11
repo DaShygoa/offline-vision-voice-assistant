@@ -1,4 +1,5 @@
 app:
+  # 默认摄像头索引（网页「设备设置」里可随时切换）
   camera_index: 0
   height: 1080
   locale: zh
@@ -7,6 +8,9 @@ app:
   ui_fps_target: 30
   width: 1920
 asr:
+  # 麦克风设备：null = 系统默认输入；也可填 sounddevice 的设备索引或名称
+  # 运行时可在网页「设备设置」里切换，无需改配置文件
+  mic_device: null
   cmvn: models/sherpa-onnx-paraformer-zh-int8/am.mvn
   decoder: models/sherpa-onnx-paraformer-zh-int8/decoder.int8.onnx
   device: cpu
@@ -65,13 +69,16 @@ resnet18:
   onnx_path: models/resnet18/resnet18.onnx
   precision: FP32
 tts:
-  # edge = 微软在线合成（音色自然，需联网）；断网时自动降级为 mock 提示音
-  # mock = 纯本地提示音（无网络也能跑通全链路）
+  # offline = 本地中文语音；edge = 在线语音，失败时使用本地语音
   edge_pitch: +0Hz
   edge_rate: +0%
   edge_voice: zh-CN-YunxiNeural
   enabled: true
   mock_wav: data/tts_beep.wav
-  mode: edge
+  mode: offline
+  offline_model_dir: models/sherpa-onnx-vits-zh-ll
+  offline_speaker: 0
+  offline_speed: 1.0
+  offline_threads: 2
   play_audio: true
   timeout_s: 30

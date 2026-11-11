@@ -1,15 +1,15 @@
-"""TTS client — classroom release (edge + mock).
+"""Asynchronous speech synthesis with an offline Chinese voice.
 
 Design rule: the vision / web thread must NEVER wait for TTS. Synthesis runs
 on a dedicated worker thread; if a backend fails we degrade to mock/skip
 without blocking recognition.
 
 Modes:
+  offline: sherpa-onnx VITS (local model, no network)
   edge  : Microsoft Edge TTS (natural Chinese voice; needs internet)
   mock  : offline beep whose length tracks the reply (no network, for fallback)
 
-On any edge error the client falls back to mock automatically, so a classroom
-with no internet still announces "something happened" without crashing.
+On an Edge error, use the local voice instead of a mock beep.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 class TtsClient:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.mode = str(cfg.get("mode", "edge")).lower()
+        self.mode = str(cfg.get("mode", "offline")).lower()
         self.timeout = float(cfg.get("timeout_s", 20))
         self.play_audio = bool(cfg.get("play_audio", True))
         self.enabled = bool(cfg.get("enabled", True))
@@ -38,6 +38,8 @@ class TtsClient:
         self._running = False
         self._sd = None
         self.ready = False
+        self._offline_tts = None
+        self._offline_error = None
         self.last_rtf = 0.0
         self.stats = {"requests": 0, "ok": 0, "fail": 0, "avg_synth_ms": 0.0}
 
@@ -113,6 +115,7 @@ class TtsClient:
                 continue
             if not text:
                 continue
+            wav_path = None
             try:
                 wav_path = self.synthesize(text)
                 if wav_path and self.play_audio:
@@ -121,6 +124,11 @@ class TtsClient:
                 self.stats["fail"] += 1
                 log.warning("TTS failed: %s", e)
             finally:
+                if wav_path and self.mode != "mock":
+                    try:
+                        os.remove(wav_path)
+                    except OSError:
+                        pass
                 self._q.task_done()
 
     def synthesize(self, text: str) -> Optional[str]:
@@ -130,12 +138,18 @@ class TtsClient:
         try:
             if self.mode == "mock":
                 path = self._mock_synth(text)
-            else:  # edge (default) — fall back to mock on any failure
+            elif self.mode == "offline":
+                path = self._offline_synth(text)
+            elif self.mode == "edge":
                 try:
                     path = self._edge_synth(text)
+                    if not path:
+                        raise RuntimeError("edge TTS returned no audio")
                 except Exception as e:
-                    log.warning("edge TTS failed (%s); falling back to mock beep", e)
-                    path = self._mock_synth(text)
+                    log.warning("edge TTS failed (%s); using offline voice", e)
+                    path = self._offline_synth(text)
+            else:
+                raise ValueError(f"unknown TTS mode: {self.mode}")
         except Exception as e:
             self.stats["fail"] += 1
             log.warning("synth error: %s", e)
@@ -148,6 +162,47 @@ class TtsClient:
         self.stats["avg_synth_ms"] = (self.stats["avg_synth_ms"] * n + dt) / (n + 1)
         self.stats["ok"] += 1
         return path
+
+    def _load_offline(self):
+        if self._offline_tts is not None:
+            return self._offline_tts
+        import sherpa_onnx
+
+        model_dir = self.cfg.get("offline_model_dir", "models/sherpa-onnx-vits-zh-ll")
+        required = ["model.onnx", "tokens.txt", "lexicon.txt", "phone.fst", "date.fst", "number.fst"]
+        missing = [name for name in required if not os.path.isfile(os.path.join(model_dir, name))]
+        if missing:
+            raise FileNotFoundError(f"offline TTS model missing in {model_dir}: {', '.join(missing)}; run python tools/prepare_models.py --tts")
+        vits = sherpa_onnx.OfflineTtsVitsModelConfig(
+            model=os.path.join(model_dir, "model.onnx"),
+            lexicon=os.path.join(model_dir, "lexicon.txt"),
+            tokens=os.path.join(model_dir, "tokens.txt"),
+        )
+        config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(vits=vits, num_threads=int(self.cfg.get("offline_threads", 2))),
+            rule_fsts=','.join(os.path.join(model_dir, f) for f in ("phone.fst", "date.fst", "number.fst")),
+        )
+        if not config.validate():
+            raise ValueError("invalid offline TTS model configuration")
+        self._offline_tts = sherpa_onnx.OfflineTts(config)
+        self._offline_error = None
+        return self._offline_tts
+
+    def _offline_synth(self, text: str) -> str:
+        import tempfile
+        try:
+            audio = self._load_offline().generate(text, sid=int(self.cfg.get("offline_speaker", 0)),
+                                                   speed=float(self.cfg.get("offline_speed", 1.0)))
+            samples = np.asarray(audio.samples, dtype=np.float32)
+            if not samples.size or not np.isfinite(samples).all() or np.max(np.abs(samples)) < 1e-4:
+                raise RuntimeError("offline TTS returned empty or silent audio")
+            with tempfile.NamedTemporaryFile(prefix="tts_offline_", suffix=".wav", delete=False) as f:
+                path = f.name
+            self._write_wav(path, samples, audio.sample_rate)
+            return path
+        except Exception as e:
+            self._offline_error = str(e)
+            raise
 
     # Available zh-CN voices (edge-tts 7.x, verified by list_voices() on this machine)
     EDGE_VOICES = (
@@ -296,6 +351,12 @@ class TtsClient:
             return "disabled"
         if self.mode == "mock":
             return "mock"
+        if self.mode == "offline":
+            if self._offline_error:
+                return "down:offline"
+            model_dir = self.cfg.get("offline_model_dir", "models/sherpa-onnx-vits-zh-ll")
+            return "ok:offline" if all(os.path.isfile(os.path.join(model_dir, f)) for f in
+                ("model.onnx", "tokens.txt", "lexicon.txt", "phone.fst", "date.fst", "number.fst")) else "down:offline-model"
         # edge — no local process to probe; report whether the SDK is importable.
         try:
             import edge_tts  # noqa: F401

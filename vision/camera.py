@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Optional
 
 import cv2
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 class Camera:
@@ -25,7 +28,8 @@ class Camera:
         self._fps_ema = 0.0
 
     def open(self) -> None:
-        cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
+        backend = getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)
+        cap = cv2.VideoCapture(self.index, backend)
         if not cap.isOpened():
             cap = cv2.VideoCapture(self.index)
         if not cap.isOpened():
@@ -84,6 +88,34 @@ class Camera:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+        # Drop the last frame so a device switch never serves the old camera's
+        # frozen picture to the MJPEG stream / depth worker.
+        with self._lock:
+            self._frame = None
+            self._frame_id += 1
+
+    def reopen(self, index: int) -> None:
+        """Switch to another device index, keeping the running state.
+
+        On failure the old index is restored (and reopened if it was running)
+        before the exception is re-raised, so the caller can simply report the
+        error instead of repairing the capture pipeline.
+        """
+        was_running = self._running
+        old_index = self.index
+        self.stop()
+        self.index = int(index)
+        try:
+            if was_running:
+                self.start()
+        except Exception:
+            self.index = old_index
+            if was_running:
+                try:
+                    self.start()
+                except Exception as restore_err:
+                    log.warning("failed to restore camera %s: %s", old_index, restore_err)
+            raise
 
     def __enter__(self) -> "Camera":
         self.start()

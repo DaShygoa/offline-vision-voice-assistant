@@ -1,7 +1,7 @@
 """Web UI for the offline vision + voice assistant.
 
 Flask + MJPEG streaming: camera feed with overlays + depth heatmap in browser,
-text command input, live status display.
+text command input, live status display, host camera/mic device picker.
 
 Usage:
     python web/server.py --config config/demo.yaml
@@ -27,6 +27,7 @@ sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
 from vision.image_io import imread_unicode
+from core import devices
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 log = logging.getLogger("web")
@@ -49,6 +50,13 @@ _status_cache: dict = {}
 def _encode_jpeg(img: np.ndarray, quality: int = 80) -> bytes:
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes() if ok else b""
+
+
+def _mjpeg_part(jpeg: bytes) -> bytes:
+    return b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+
+
+_MJPEG_MIME = "multipart/x-mixed-replace; boundary=frame"
 
 
 def _frame_loop():
@@ -156,7 +164,7 @@ def _mjpeg_gen(jpeg_attr: str):
         with _jpeg_lock:
             data = globals()[jpeg_attr]
         if data:
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n")
+            yield _mjpeg_part(data)
         time.sleep(0.033)
 
 
@@ -167,12 +175,12 @@ def index():
 
 @app.route("/video")
 def video():
-    return Response(_mjpeg_gen("_latest_jpeg"), mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(_mjpeg_gen("_latest_jpeg"), mimetype=_MJPEG_MIME)
 
 
 @app.route("/depth")
 def depth():
-    return Response(_mjpeg_gen("_latest_depth_jpeg"), mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(_mjpeg_gen("_latest_depth_jpeg"), mimetype=_MJPEG_MIME)
 
 
 @app.route("/command", methods=["POST"])
@@ -194,6 +202,7 @@ def status():
     s = _assistant.stats
     return jsonify({
         "ready": True,
+        **_assistant.current_devices,
         "fps": round(s.ui_fps, 1),
         "mode": s.mode,
         "last_intent": s.last_intent,
@@ -252,6 +261,162 @@ def mic_toggle():
         enabled = not _assistant.mic_enabled
     state = _assistant.set_mic_enabled(bool(enabled))
     return jsonify({"ok": True, "mic_enabled": state})
+
+
+# ------------------------------------------------------------- device picker
+@app.route("/devices", methods=["GET"])
+def devices_list():
+    """Enumerate devices attached to the machine running the server.
+
+    Camera probing is slow (each DirectShow open() ~1 s), so it runs in a
+    background thread; the browser polls until ``scanning`` becomes false.
+    ``?refresh=1`` forces a fresh scan; ``?all_mics=1`` returns every host API
+    of every microphone instead of the de-duplicated WASAPI view.
+    """
+    if _assistant is None:
+        return jsonify({"ready": False, "cameras": [], "microphones": [], "scanning": False})
+    cur = _assistant.current_devices
+    force = request.args.get("refresh") in ("1", "true", "yes")
+    all_mics = request.args.get("all_mics") in ("1", "true", "yes")
+    devices.start_camera_scan(cur["camera_index"], force=force)
+    snap = devices.camera_snapshot()
+    mic = devices.mic_catalog(cur["mic_device"], all_hostapis=all_mics)
+    return jsonify({
+        "ready": True,
+        "cameras": snap["cameras"],
+        "camera_info": {"named": snap["named"], "unavailable": snap["unavailable"]},
+        "microphones": mic["devices"],
+        "mic_info": {k: mic[k] for k in ("preferred_host", "total", "hidden", "compact")},
+        "scanning": snap["scanning"],
+        "scan_error": snap["scan_error"],
+        "camera_enabled": _assistant.camera_enabled,
+        **cur,
+    })
+
+
+@app.route("/devices", methods=["POST"])
+def devices_apply():
+    """Apply the selected camera index and/or microphone device."""
+    global _latest_jpeg, _latest_depth_jpeg
+    if _assistant is None:
+        return jsonify({"ok": False, "errors": {"app": "assistant not ready"}}), 503
+    data = request.get_json(silent=True) or {}
+    errors: dict = {}
+
+    if "camera" in data:
+        # A live preview holds an exclusive capture on the candidate index;
+        # free it before the real camera tries to open the same device.
+        devices.stop_previews()
+        try:
+            idx = int(data["camera"])
+        except (TypeError, ValueError):
+            errors["camera"] = "摄像头索引无效"
+        else:
+            if not 0 <= idx <= 64:
+                errors["camera"] = "摄像头索引超出范围（0–64）"
+            elif not _assistant.set_camera_device(idx):
+                label = devices.camera_name(idx)
+                errors["camera"] = f"无法打开 {label}（索引 {idx}），已恢复原设备"
+            else:
+                # Old camera's frozen frame must not linger in the MJPEG stream.
+                with _jpeg_lock:
+                    _latest_jpeg = None
+                    _latest_depth_jpeg = None
+
+    if "mic" in data:
+        raw = data["mic"]
+        if raw is None or raw == "" or str(raw).lower() == "default":
+            chosen = None                      # system default input
+        else:
+            try:
+                chosen = int(raw)              # sounddevice index
+            except (TypeError, ValueError):
+                chosen = str(raw)[:120]        # device name substring
+        if not _assistant.set_mic_device(chosen):
+            errors["mic"] = "无法打开该麦克风，已恢复原设备"
+
+    return jsonify({
+        "ok": not errors,
+        "errors": errors,
+        **_assistant.current_devices,
+        "camera_enabled": _assistant.camera_enabled,
+        "mic_enabled": _assistant.mic_enabled,
+    })
+
+
+def _parse_camera_index() -> Optional[int]:
+    try:
+        idx = int(request.args.get("index", 0))
+    except (TypeError, ValueError):
+        return None
+    return idx if 0 <= idx <= 64 else None
+
+
+@app.route("/devices/preview/stream")
+def devices_preview_stream():
+    """Live MJPEG preview for the device picker (not a frozen snapshot).
+
+    For the camera already in use we reuse the main frame buffer. For a
+    candidate index a dedicated capture is opened and streamed until the
+    browser disconnects, another preview starts, or /preview/stop is called.
+    """
+    idx = _parse_camera_index()
+    if idx is None:
+        return jsonify({"error": "摄像头索引无效"}), 400
+
+    # Reuse the main frame buffer for the active camera (a second DSHOW open()
+    # on the same device usually fails). If no frame is available -- e.g. the
+    # camera is switched off, or it was just re-opened -- fall through to a
+    # dedicated capture rather than leaving the browser waiting forever.
+    use_live = False
+    if (_assistant is not None and idx == _assistant.camera.index
+            and _assistant.camera_enabled):
+        for _ in range(10):
+            with _jpeg_lock:
+                data = _latest_jpeg
+            if data:
+                use_live = True
+                break
+            time.sleep(0.06)
+
+    if use_live:
+        devices.stop_previews()
+        token = devices.current_preview_token()
+
+        def live_gen():
+            while True:
+                if devices.current_preview_token() != token:
+                    return
+                with _jpeg_lock:
+                    data = _latest_jpeg
+                if data:
+                    yield _mjpeg_part(data)
+                time.sleep(0.033)
+
+        return Response(live_gen(), mimetype=_MJPEG_MIME,
+                        headers={"Cache-Control": "no-store"})
+
+    try:
+        frames = devices.begin_preview(idx)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 503
+
+    def preview_gen():
+        try:
+            for jpeg in frames:
+                yield _mjpeg_part(jpeg)
+        finally:
+            frames.close()   # releases the capture even on early disconnect
+
+    return Response(preview_gen(), mimetype=_MJPEG_MIME,
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.route("/devices/preview/stop", methods=["POST"])
+def devices_preview_stop():
+    """Release the preview capture when the modal is closed."""
+    devices.stop_previews()
+    return jsonify({"ok": True})
 
 
 @app.route("/chat")
@@ -339,11 +504,23 @@ def main():
                    help="不打开摄像头（稍后可在网页上开启）")
     p.add_argument("--no-mic", action="store_true",
                    help="不打开麦克风（稍后可在网页上开启）")
+    p.add_argument("--camera-index", type=int, default=None,
+                   help="初始摄像头索引（也可在网页「设备设置」里切换）")
+    p.add_argument("--mic-device", default=None,
+                   help="初始麦克风：sounddevice 索引或名称；不填=系统默认")
     args = p.parse_args()
 
     from core.config import load_config
 
     cfg = load_config(args.config)
+    if args.camera_index is not None:
+        cfg.setdefault("app", {})["camera_index"] = args.camera_index
+    if args.mic_device is not None:
+        try:
+            mic = int(args.mic_device)
+        except ValueError:
+            mic = args.mic_device
+        cfg.setdefault("asr", {})["mic_device"] = mic
 
     # web mode: no OpenCV windows
     from core.app import AssistantApp

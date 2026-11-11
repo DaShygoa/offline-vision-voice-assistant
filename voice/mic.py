@@ -24,6 +24,11 @@ class MicStream:
         self._q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=int(max_queue_s * 1000 / frame_ms))
         self._stream = None
         self._running = False
+        # Persisted device choice: None = system default, otherwise a
+        # sounddevice index or a name substring. Kept across stop/start so the
+        # web picker's selection survives a mic toggle or voice-loop restart.
+        self.device = None
+        self.device_index: Optional[int] = None
         self.device_name = ""
         self.available = False
 
@@ -37,6 +42,9 @@ class MicStream:
             return []
 
     def start(self, device: Optional[int | str] = None) -> bool:
+        # No explicit argument -> reuse the device chosen in the web settings.
+        if device is None:
+            device = self.device
         try:
             import sounddevice as sd
         except Exception as e:
@@ -71,6 +79,13 @@ class MicStream:
             self._stream.start()
             info = sd.query_devices(device) if device is not None else sd.query_devices(kind="input")
             self.device_name = str(info.get("name", "")) if isinstance(info, dict) else ""
+            self.device = device
+            try:
+                dev_idx = self._stream.device
+                self.device_index = int(dev_idx) if isinstance(dev_idx, int) else None
+            except Exception:
+                self.device_index = None
+            self.flush()
             self._running = True
             self.available = True
             log.info("Mic started: %s @ %d Hz", self.device_name or "default", self.sample_rate)
@@ -80,6 +95,14 @@ class MicStream:
             self.available = False
             return False
 
+    def flush(self) -> None:
+        """Drop buffered audio, e.g. when switching devices mid-utterance."""
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                return
+
     def read(self, timeout: float = 0.2) -> Optional[np.ndarray]:
         try:
             return self._q.get(timeout=timeout)
@@ -88,6 +111,7 @@ class MicStream:
 
     def stop(self) -> None:
         self._running = False
+        self.available = False
         if self._stream is not None:
             try:
                 self._stream.stop()

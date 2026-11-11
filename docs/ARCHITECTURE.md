@@ -21,7 +21,7 @@
 | 物体录入 + 特征保存 | 多视角采样 → SQLite + NumPy 特征库 |
 | 识别返回名称 + 相似度 | 余弦检索 Top-K，附带相似度百分比 |
 | 相似度低时显示未知物体 | 阈值 + 分数差距双重判定（见第五节） |
-| 语音说出物体名称 + 语音播报 | Paraformer ASR + Edge TTS（断网降级 mock） |
+| 语音说出物体名称 + 语音播报 | Paraformer ASR + 离线中文 TTS |
 | 简单界面 | Flask 浏览器页面（视频流 + 深度图 + 物体库） |
 | ≥5 物体 ×≥5 图，≥3 未录入物体 | 场景测试图已入库于 `data/test_scenes/` |
 
@@ -60,7 +60,7 @@
        ▼             ▼
 ┌────────────────┐  ┌──────────────────────┐
 │Depth Anything  │  │Silero VAD + Paraformer│
-│V2 / ResNet18   │  │ + Edge TTS / mock     │
+│V2 / ResNet18   │  │ + 离线 TTS / Edge     │
 │(ONNX Runtime)  │  └──────────────────────┘
 └────────────────┘
        │
@@ -119,7 +119,7 @@ MJPEG 编码一起释放（这三个是主要 CPU 消耗），摄像头预览保
 | 深度模型缺失 | 回退画面中心 45% ROI，功能可用 |
 | ResNet18 缺失 | 明确提示运行 `prepare_models.py --resnet18`（实质影响功能） |
 | 麦克风缺失 | 自动切到网页文字输入 |
-| Edge TTS 断网 | 自动降级为 mock 提示音，识别不受影响 |
+| Edge TTS 断网 | 自动切换到离线中文语音，识别不受影响 |
 | 画面质量差 / 未定位到物体 | 明确提示重举，不静默误匹配 |
 
 ---
@@ -247,14 +247,15 @@ SQLite 只管元数据（按名查询、列出物体、级联删除），量小�
 | ASR | sherpa-onnx Paraformer INT8；兼容端到端单模型与 encoder/decoder 双模型两种布局 |
 | 半双工 | 播报后按文本长度短暂静音麦克风，避免 TTS 被自己识别回去 |
 
-### 语音输出（edge + mock）
+### 语音输出（离线 + Edge）
 
 | `tts.mode` | 联网 | 说明 |
 | --- | --- | --- |
-| `edge`（默认） | 是 | 微软 Edge TTS，延迟低、中文音色自然 |
+| `offline`（默认） | 否 | sherpa-onnx 本地中文语音 |
+| `edge` | 是 | 微软 Edge TTS，失败时回退到离线语音 |
 | `mock` | 否 | 按回复长度生成提示音，无网络也能跑通全链路 |
 
-任何 edge 失败（无网、SDK 缺失、合成静音）都会自动回退 mock，不抛错给主流程。
+任何 edge 失败（无网、SDK 缺失、合成静音）都会自动回退离线语音，不抛错给主流程。
 
 ### 必须绕过系统代理
 
@@ -308,7 +309,7 @@ REMEMBER 必须先于 SEARCH ——「记住，这个叫X」含「叫」
 | 深度跑了就拒识而不回退中心 ROI | 避免把画面中央的人脸误匹配进库 |
 | 规则 NLU 不用 LLM | 离线 + 句式固定 + 可解释 |
 | 只留浏览器界面 | 减少入口与依赖，演示路径唯一、稳定 |
-| Edge TTS 自动降级 mock | 有网时音色自然，断网也不中断演示 |
+| Edge TTS 自动回退离线语音 | 断网也可语音播报 |
 | 默认关闭画面落盘 | 避免把课堂参与者肖像写入磁盘 |
 
 ---
@@ -343,5 +344,5 @@ REMEMBER 必须先于 SEARCH ——「记住，这个叫X」含「叫」
 | `vision/visualizer.py` | 共享 OverlayState（网页自行绘制画面） |
 | `voice/asr.py` | Paraformer，兼容两种模型布局 |
 | `voice/vad.py` | Silero VAD + 预卷缓冲 |
-| `voice/tts.py` | Edge TTS + mock 自动降级 |
+| `voice/tts.py` | 离线中文语音 + Edge 在线语音 |
 | `nlu/intent.py` | 6 类意图正则解析 + ASR 纠错 |
